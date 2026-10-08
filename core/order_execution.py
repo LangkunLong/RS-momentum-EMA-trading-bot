@@ -184,6 +184,8 @@ class ProtectiveStopResult:
     action: str
     error: str = ""
     client_order_id: str = ""
+    outcome_uncertain: bool = False
+    prior_protection_retained: bool = False
 
 
 @dataclass
@@ -1004,6 +1006,19 @@ def _durable_buy_fill_order_ids_from_workflow(workflow: object) -> set[str]:
     }
 
 
+def _protective_stop_price(
+    avg_entry_price: float,
+    stop_loss_pct: float,
+    stop_price_override: float | None,
+) -> float:
+    if stop_price_override is None:
+        return round(avg_entry_price * (1 - stop_loss_pct), 2)
+    target = float(stop_price_override)
+    if not math.isfinite(target) or target <= 0:
+        raise ValueError("stop_price_override must be a positive finite price")
+    return round(target, 2)
+
+
 @_serialized_reconciliation
 def ensure_protective_stop(
     symbol: str,
@@ -1015,10 +1030,12 @@ def ensure_protective_stop(
     entry_order_id: Optional[str] = None,
     entry_order_ids: Optional[set[str]] = None,
     durable_sell_fill_qty: float = 0.0,
+    stop_price_override: float | None = None,
 ) -> ProtectiveStopResult:
     """Fence causal entry exposure and prove exact workflow-linked protection."""
     if stop_loss_pct is None:
         stop_loss_pct = settings.STOP_LOSS_PCT
+    requested_stop_price = _protective_stop_price(fill_price, stop_loss_pct, stop_price_override)
     del open_orders  # Injected snapshots cannot prove current broker safety.
 
     if not workflow_id:
@@ -1027,7 +1044,7 @@ def ensure_protective_stop(
             order_id="",
             symbol=symbol,
             qty=qty,
-            stop_price=round(fill_price * (1 - stop_loss_pct), 2),
+            stop_price=requested_stop_price,
             action="missing_workflow",
             error="A workflow id is required before protective-stop mutation",
         )
@@ -1105,6 +1122,8 @@ def ensure_protective_stop(
                 "workflow_id": workflow_id,
                 "stop_loss_pct": stop_loss_pct,
             }
+            if stop_price_override is not None:
+                reconcile_kwargs["stop_price_override"] = stop_price_override
             if durable_entry_ids:
                 if resolved_sell_fill_qty > terminal_filled_qty + 0.0001:
                     raise RuntimeError(
@@ -1199,7 +1218,7 @@ def ensure_protective_stop(
             if protection.action in {"pending_buy", "position_sync_pending"} and can_retry:
                 time.sleep(_SAFETY_SNAPSHOT_POLL_INTERVAL)
                 continue
-            if protection.action in {"unsafe_orders", "flat_with_open_orders"}:
+            if protection.action in {"unsafe_orders", "flat_with_open_orders"} and stop_price_override is None:
                 cancel_open_orders_verified(symbol)
                 if not can_retry:
                     return protection
@@ -1213,7 +1232,7 @@ def ensure_protective_stop(
                     order_id="",
                     symbol=symbol,
                     qty=qty,
-                    stop_price=round(fill_price * (1 - stop_loss_pct), 2),
+                    stop_price=requested_stop_price,
                     action="position_not_visible",
                     error="A reported buy fill is not yet visible as a broker position",
                 )
@@ -1235,7 +1254,7 @@ def ensure_protective_stop(
             order_id="",
             symbol=symbol,
             qty=qty,
-            stop_price=round(fill_price * (1 - stop_loss_pct), 2),
+            stop_price=requested_stop_price,
             action="reconciliation_failed",
             error=str(exc),
         )
@@ -1245,7 +1264,7 @@ def ensure_protective_stop(
         order_id="",
         symbol=symbol,
         qty=qty,
-        stop_price=round(fill_price * (1 - stop_loss_pct), 2),
+        stop_price=requested_stop_price,
         action="pending_buy",
         error="Entry remainder did not converge before protection",
     )
@@ -1546,6 +1565,7 @@ def reconcile_symbol_after_exit_failure(
     workflow_id: str,
     stop_loss_pct: float | None = None,
     minimum_position_qty: float = 0.0,
+    stop_price_override: float | None = None,
 ) -> ProtectiveStopResult:
     """Prove the symbol is flat, fully exiting, or exactly stop-protected."""
     if not workflow_id:
@@ -1643,9 +1663,10 @@ def reconcile_symbol_after_exit_failure(
                 order_id=str(getattr(visible_exit, "id", "") or ""),
                 symbol=symbol,
                 qty=position.qty,
-                stop_price=round(
-                    position.avg_entry_price * (1 - resolved_stop_loss_pct),
-                    2,
+                stop_price=_protective_stop_price(
+                    position.avg_entry_price,
+                    resolved_stop_loss_pct,
+                    stop_price_override,
                 ),
                 action="pending_exit",
             )
@@ -1655,7 +1676,11 @@ def reconcile_symbol_after_exit_failure(
             symbol=symbol,
             qty=position.qty if position is not None else 0.0,
             stop_price=(
-                round(position.avg_entry_price * (1 - resolved_stop_loss_pct), 2)
+                _protective_stop_price(
+                    position.avg_entry_price,
+                    resolved_stop_loss_pct,
+                    stop_price_override,
+                )
                 if position is not None
                 else 0.0
             ),
@@ -1722,7 +1747,11 @@ def reconcile_symbol_after_exit_failure(
             order_id="",
             symbol=symbol,
             qty=position.qty,
-            stop_price=round(position.avg_entry_price * (1 - resolved_stop_loss_pct), 2),
+            stop_price=_protective_stop_price(
+                position.avg_entry_price,
+                resolved_stop_loss_pct,
+                stop_price_override,
+            ),
             action="position_sync_pending",
             error=(
                 f"Broker position {position.qty} has not caught up to terminal "
@@ -1730,7 +1759,11 @@ def reconcile_symbol_after_exit_failure(
             ),
         )
 
-    stop_price = round(position.avg_entry_price * (1 - resolved_stop_loss_pct), 2)
+    stop_price = _protective_stop_price(
+        position.avg_entry_price,
+        resolved_stop_loss_pct,
+        stop_price_override,
+    )
     if recovered_stop_order is not None:
         recovered_order_id = str(getattr(recovered_stop_order, "id", "") or "")
         matching_recovered_stops = [
@@ -1826,24 +1859,141 @@ def reconcile_symbol_after_exit_failure(
             and _is_close_match(_order_stop_price(stop_order) or 0.0, stop_price)
         )
         if not exact_stop:
+            if stop_price_override is not None:
+                stop_order_id = str(getattr(stop_order, "id", "") or "") if stop_order else ""
+                observed_stop_price = _order_stop_price(stop_order) if stop_order else None
+                if observed_stop_price is not None and observed_stop_price > stop_price + 0.0001:
+                    retained_stop_is_exact = bool(
+                        len(stop_orders) == 1
+                        and stop_order is not None
+                        and len(open_orders) == 1
+                        and _is_workflow_stop_order(stop_order, workflow_id)
+                        and stop_order_id
+                        and _is_close_match(
+                            _order_remaining_qty(stop_order), position.qty, tolerance=0.0001
+                        )
+                    )
+                    if retained_stop_is_exact:
+                        return ProtectiveStopResult(
+                            success=False,
+                            order_id=stop_order_id,
+                            symbol=symbol,
+                            qty=position.qty,
+                            stop_price=observed_stop_price,
+                            action="stronger_existing_stop_unadopted",
+                            error="Existing broker protection is stronger than the requested policy target",
+                            client_order_id=str(getattr(stop_order, "client_order_id", "") or ""),
+                        )
+                    return ProtectiveStopResult(
+                        success=False,
+                        order_id=stop_order_id,
+                        symbol=symbol,
+                        qty=position.qty,
+                        stop_price=observed_stop_price,
+                        action="unsafe_orders",
+                        error="A stronger STOP does not match the exact workflow and current position quantity",
+                        client_order_id=str(getattr(stop_order, "client_order_id", "") or ""),
+                    )
+                if (
+                    len(stop_orders) != 1
+                    or stop_order is None
+                    or len(open_orders) != 1
+                    or not _is_workflow_stop_order(stop_order, workflow_id)
+                    or not stop_order_id
+                    or workflow is None
+                ):
+                    return ProtectiveStopResult(
+                        success=False,
+                        order_id=stop_order_id,
+                        symbol=symbol,
+                        qty=position.qty,
+                        stop_price=stop_price,
+                        action="unsafe_orders",
+                        error="Only one exact workflow-owned STOP may be replaced",
+                    )
+                stop_client = str(getattr(stop_order, "client_order_id", "") or "")
+                workflow.mark_protective_stop(
+                    success=False,
+                    stop_order_id=stop_order_id,
+                    stop_price=stop_price,
+                    action="policy_stop_replace_cancel_pending",
+                    error="Policy stop intent is durable before exact stale STOP cancellation",
+                    stop_client_order_id=stop_client,
+                )
+                try:
+                    _cancel_order_ids_verified(symbol, {stop_order_id})
+                    refreshed_position, refreshed_orders = _sample_stable_symbol_state(symbol)
+                except Exception as exc:  # noqa: BLE001
+                    return ProtectiveStopResult(
+                        success=False,
+                        order_id=stop_order_id,
+                        symbol=symbol,
+                        qty=position.qty,
+                        stop_price=stop_price,
+                        action="policy_stop_replace_cancel_failed",
+                        error=str(exc),
+                        client_order_id=stop_client,
+                    )
+                if refreshed_position is None:
+                    return ProtectiveStopResult(
+                        success=False,
+                        order_id=stop_order_id,
+                        symbol=symbol,
+                        qty=0.0,
+                        stop_price=stop_price,
+                        action="position_sync_pending",
+                        error="Position disappeared while replacing policy protection",
+                        client_order_id=stop_client,
+                    )
+                if refreshed_orders:
+                    return ProtectiveStopResult(
+                        success=False,
+                        order_id=stop_order_id,
+                        symbol=symbol,
+                        qty=refreshed_position.qty,
+                        stop_price=stop_price,
+                        action="unsafe_orders",
+                        error="Other symbol orders appeared while replacing policy protection",
+                        client_order_id=stop_client,
+                    )
+                if refreshed_position.qty + 0.0001 < max(0.0, float(minimum_position_qty)):
+                    return ProtectiveStopResult(
+                        success=False,
+                        order_id=stop_order_id,
+                        symbol=symbol,
+                        qty=refreshed_position.qty,
+                        stop_price=stop_price,
+                        action="position_sync_pending",
+                        error="Broker quantity regressed while replacing policy protection",
+                        client_order_id=stop_client,
+                    )
+                position = refreshed_position
+                open_orders = refreshed_orders
+                stop_price = _protective_stop_price(
+                    position.avg_entry_price,
+                    resolved_stop_loss_pct,
+                    stop_price_override,
+                )
+            else:
+                return ProtectiveStopResult(
+                    success=False,
+                    order_id=str(getattr(stop_order, "id", "") or "") if stop_order else "",
+                    symbol=symbol,
+                    qty=position.qty,
+                    stop_price=stop_price,
+                    action="unsafe_orders",
+                    error="Open stop orders do not prove exact workflow-linked protection",
+                )
+        else:
             return ProtectiveStopResult(
-                success=False,
-                order_id=str(getattr(stop_order, "id", "") or "") if stop_order else "",
+                success=True,
+                order_id=str(getattr(stop_order, "id", "") or ""),
                 symbol=symbol,
                 qty=position.qty,
                 stop_price=stop_price,
-                action="unsafe_orders",
-                error="Open stop orders do not prove exact workflow-linked protection",
+                action="reused",
+                client_order_id=str(getattr(stop_order, "client_order_id", "") or ""),
             )
-        return ProtectiveStopResult(
-            success=True,
-            order_id=str(getattr(stop_order, "id", "") or ""),
-            symbol=symbol,
-            qty=position.qty,
-            stop_price=stop_price,
-            action="reused",
-            client_order_id=str(getattr(stop_order, "client_order_id", "") or ""),
-        )
 
     if open_orders:
         return ProtectiveStopResult(
@@ -2007,7 +2157,11 @@ def reconcile_symbol_after_exit_failure(
         )
         and _is_close_match(
             _order_stop_price(order) or 0.0,
-            round(refreshed_position.avg_entry_price * (1 - resolved_stop_loss_pct), 2),
+            _protective_stop_price(
+                refreshed_position.avg_entry_price,
+                resolved_stop_loss_pct,
+                stop_price_override,
+            ),
         )
     ]
     if refreshed_position is not None and len(refreshed_orders) == 1 and len(matching_stops) == 1:
@@ -2016,9 +2170,10 @@ def reconcile_symbol_after_exit_failure(
             order_id=submitted.order_id,
             symbol=symbol,
             qty=refreshed_position.qty,
-            stop_price=round(
-                refreshed_position.avg_entry_price * (1 - resolved_stop_loss_pct),
-                2,
+            stop_price=_protective_stop_price(
+                refreshed_position.avg_entry_price,
+                resolved_stop_loss_pct,
+                stop_price_override,
             ),
             action="submitted",
             client_order_id=stop_client_order_id,

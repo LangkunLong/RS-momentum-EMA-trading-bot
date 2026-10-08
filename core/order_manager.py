@@ -7,14 +7,16 @@ under a single workflow id.
 
 from __future__ import annotations
 
-from datetime import datetime
+from dataclasses import asdict, dataclass, replace
+from datetime import UTC, datetime
 from decimal import Decimal
-from dataclasses import dataclass
+import hashlib
 import math
 import threading
 import time
 from typing import Any, Callable, Optional
 
+from config import settings
 from core.policy_addition import (
     AdditionCancelResult,
     AdditionPlan,
@@ -51,8 +53,6 @@ from core.execution_workflow import (
 )
 from core.notifier import notify_buy_filled, notify_entry_submitted, notify_sell_filled
 from core.operation_limits import current_operation_budget
-from core.policy_execution_state import ActionStatus, PortfolioStateSnapshot
-from core.policy_execution_store import PolicyExecutionStateStore
 from core.strategy_policy.account_reconciliation import BrokerAccountSnapshot
 from core.order_execution import (
     OrderResult,
@@ -69,6 +69,9 @@ from core.order_execution import (
     require_paper_mode,
     submit_bracket_buy,
 )
+from core.policy_execution_state import ActionRole, ActionStatus, OrderSide, PortfolioStateSnapshot
+from core.policy_execution_store import PolicyExecutionStateStore
+from core.policy_protection_bridge import PolicyProtectionBridge
 
 
 _FILL_HANDLING_LOCK = threading.RLock()
@@ -94,6 +97,67 @@ _CLOSED_REPLAY_ORDER_STATUSES = {
     "replaced",
 }
 
+_UNRESOLVED_PROTECTION_ACTIONS = frozenset(
+    {
+        "position_not_visible",
+        "position_sync_pending",
+        "submission_unknown",
+        "pending_stop_target_conflict",
+        "stop_replace_cancel_pending",
+        "stop_replace_cancel_failed",
+        "submission_intent_persist_failed",
+        "pending_buy",
+        "unsafe_orders",
+        "snapshot_unstable",
+        "orders_transitioning",
+        "reconciliation_failed",
+        "pending_exit",
+        "exit_outcome_unresolved",
+        "flat_with_open_orders",
+    }
+)
+_DEFINITE_PROTECTION_FAILURE_ACTIONS = frozenset(
+    {"submit_failed", "postcondition_failed", "missing_workflow"}
+)
+
+
+def _protection_failure_class(action: str) -> str:
+    """Classify the lower protection outcome, independent of policy provenance."""
+    normalized = str(action or "").split(".")[-1].strip().lower()
+    if normalized.startswith("policy_"):
+        normalized = normalized[len("policy_") :]
+    if normalized in _UNRESOLVED_PROTECTION_ACTIONS:
+        return "unresolved"
+    if normalized == "stronger_existing_stop_unadopted":
+        return "retained_protection"
+    if normalized in _DEFINITE_PROTECTION_FAILURE_ACTIONS:
+        return "definite_failure"
+    return "unresolved"
+
+
+def _raise_for_non_definite_protection_failure(
+    *, symbol: str, protection: ProtectiveStopResult
+) -> None:
+    """Raise for unresolved/retained outcomes before any owned safety action."""
+    outcome = (
+        "retained_protection"
+        if protection.prior_protection_retained
+        else "unresolved"
+        if protection.outcome_uncertain
+        else _protection_failure_class(protection.action)
+    )
+    if outcome == "unresolved":
+        raise RuntimeError(
+            f"Safety remains unproven for {symbol}: "
+            f"{protection.error or protection.action}"
+        )
+    if outcome == "retained_protection":
+        raise RuntimeError(
+            f"The existing protective stop remains active for {symbol}; "
+            f"the requested replacement was not adopted: {protection.error or protection.action}"
+        )
+    return
+
 
 @dataclass(frozen=True)
 class EntrySubmissionOutcome:
@@ -105,6 +169,7 @@ class EntrySubmissionOutcome:
     dry_run: bool
     order_id: str = ""
     error: str = ""
+    outcome_uncertain: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,10 +214,490 @@ class PendingExitSafetyError(RuntimeError):
 class OrderManager:
     """Own the end-to-end execution lifecycle for orders."""
 
-    def __init__(self, *, paper: Optional[bool] = None) -> None:
+    def __init__(
+        self,
+        *,
+        paper: Optional[bool] = None,
+        policy_store: PolicyExecutionStateStore | None = None,
+    ) -> None:
         resolved_paper = _is_paper_mode() if paper is None else paper
         require_paper_mode(resolved_paper)
         self._paper = True
+        self._policy_store = policy_store
+
+    def record_policy_cumulative_fill(
+        self,
+        logical_action_id: str,
+        *,
+        attempt_number: int,
+        side: str,
+        broker_order_id: str,
+        client_order_id: str | None,
+        cumulative_quantity: Decimal,
+        average_fill_price: Decimal | None,
+        cumulative_fees: Decimal | None = None,
+        observed_at: datetime | None = None,
+    ) -> Any:
+        """Persist one broker-confirmed fill checkpoint for any policy action."""
+        if self._policy_store is None:
+            raise RuntimeError("record_policy_cumulative_fill requires an explicit policy store")
+        with _FILL_HANDLING_LOCK:
+            projection = self._policy_store.load_action_projection(logical_action_id)
+            normalized_side = str(side).split(".")[-1].strip().lower()
+            if normalized_side != projection.side.value:
+                raise ValueError("broker fill side differs from the persisted policy action")
+            return PolicyProtectionBridge(
+                self._policy_store,
+                provider_id=self._policy_provider_id(projection),
+            ).record_cumulative_fill(
+                logical_action_id,
+                attempt_number=attempt_number,
+                broker_order_id=broker_order_id,
+                client_order_id=client_order_id,
+                cumulative_quantity=cumulative_quantity,
+                average_fill_price=average_fill_price,
+                cumulative_fees=cumulative_fees,
+                observed_at=observed_at,
+            )
+
+    def reconcile_policy_protection(
+        self,
+        logical_action_id: str,
+        *,
+        workflow_id: str,
+        average_entry_price: Decimal,
+        entry_order_id: str | None = None,
+        entry_order_ids: set[str] | None = None,
+        durable_sell_fill_qty: Decimal = Decimal("0"),
+        observed_at: datetime | None = None,
+    ) -> ProtectiveStopResult:
+        """Reconcile against a persisted policy stop and confirm only broker facts."""
+        if self._policy_store is None:
+            raise RuntimeError("reconcile_policy_protection requires an explicit policy store")
+        with _FILL_HANDLING_LOCK:
+            workflow = get_workflow(workflow_id)
+            if workflow is None:
+                raise ValueError(f"policy protection workflow {workflow_id} is unavailable")
+            projection = self._policy_store.load_action_projection(logical_action_id)
+            return PolicyProtectionBridge(
+                self._policy_store,
+                provider_id=self._policy_provider_id(projection),
+            ).reconcile_protective_stop(
+                logical_action_id,
+                workflow=workflow,
+                average_entry_price=average_entry_price,
+                entry_order_id=entry_order_id,
+                entry_order_ids=entry_order_ids,
+                durable_sell_fill_qty=durable_sell_fill_qty,
+                observed_at=observed_at,
+            )
+
+    def submit_policy_entry(
+        self,
+        plan: EntryExecutionPlan,
+        *,
+        logical_action_id: str,
+        dry_run: bool = False,
+        execution_ready: Callable[[], bool] | None = None,
+        market_open_check: Callable[[], bool] | None = None,
+    ) -> EntrySubmissionOutcome:
+        """Consume one durable policy entry intent through the legacy workflow."""
+        if self._policy_store is None:
+            raise RuntimeError("submit_policy_entry requires an explicit policy store")
+        self._validate_policy_entry_guard_callbacks(
+            dry_run=dry_run,
+            execution_ready=execution_ready,
+            market_open_check=market_open_check,
+        )
+        projection = self._policy_store.load_action_projection(logical_action_id)
+        if projection.role not in {ActionRole.ENTRY, ActionRole.REPLACEMENT}:
+            raise ValueError("policy entry action must have role entry or replacement")
+        if projection.side is not OrderSide.BUY:
+            raise ValueError("policy entry action must be a buy")
+        if projection.status not in {
+            ActionStatus.INTENDED,
+            ActionStatus.SUBMITTED,
+            ActionStatus.PARTIALLY_FILLED,
+            ActionStatus.CANCEL_REQUESTED,
+            ActionStatus.RECONCILIATION_REQUIRED,
+        }:
+            raise ValueError("policy entry action is not open for workflow consumption")
+        if projection.reservation_price is None or projection.reservation_stop_price is None:
+            raise ValueError("policy entry action requires a durable reservation price and stop")
+        if projection.risk_per_unit is None:
+            raise ValueError("policy entry action requires a durable per-unit risk")
+
+        target_symbol = projection.broker_symbol.strip().upper()
+        expected = (
+            ("symbol", plan.symbol.strip().upper(), target_symbol),
+            ("quantity", plan.qty, float(projection.requested_quantity)),
+            ("entry price", plan.entry_price, float(projection.reservation_price)),
+            ("stop price", plan.stop_price, float(projection.reservation_stop_price)),
+            ("risk per share", plan.risk_per_share, float(projection.risk_per_unit)),
+            (
+                "position value",
+                plan.position_value,
+                float(projection.requested_quantity * projection.reservation_price),
+            ),
+            (
+                "risk amount",
+                plan.risk_amount,
+                float(projection.requested_quantity * projection.risk_per_unit),
+            ),
+        )
+        for name, actual, expected_value in expected:
+            if name == "symbol":
+                matches = actual == expected_value
+            else:
+                matches = math.isclose(float(actual), float(expected_value), rel_tol=0.0, abs_tol=1e-7)
+            if not matches:
+                raise ValueError(f"entry plan {name} differs from the persisted policy action")
+        expected_stop_loss_pct = (
+            float(projection.reservation_price - projection.reservation_stop_price)
+            / float(projection.reservation_price)
+        )
+        if not math.isclose(plan.stop_loss_pct, expected_stop_loss_pct, rel_tol=0.0, abs_tol=5e-5):
+            raise ValueError("entry plan stop-loss percentage differs from the persisted policy stop")
+
+        workflow_id = self._policy_workflow_id(target_symbol, logical_action_id)
+        attempt = projection.order_attempts[0]
+        if attempt.client_order_id not in {None, workflow_id}:
+            raise ValueError("policy action is already bound to a different client order id")
+        if dry_run:
+            workflow = self._create_or_resume_policy_entry_workflow(
+                projection=projection,
+                plan=plan,
+                workflow_id=workflow_id,
+            )
+            workflow.mark_dry_run_skipped()
+            return EntrySubmissionOutcome(
+                symbol=target_symbol,
+                workflow_id=workflow_id,
+                success=True,
+                dry_run=True,
+            )
+
+        if attempt.client_order_id is None:
+            projection = self._policy_store.bind_attempt_order_refs(
+                logical_action_id,
+                1,
+                provider_id=self._policy_provider_id(projection),
+                client_order_id=workflow_id,
+                expected_action_version=int(projection.state_version or 0),
+                observed_at=datetime.now(UTC),
+            )
+
+        workflow = self._create_or_resume_policy_entry_workflow(
+            projection=projection,
+            plan=plan,
+            workflow_id=workflow_id,
+        )
+
+        if workflow.broker_order_id:
+            self._bind_policy_broker_reference(
+                logical_action_id,
+                projection,
+                workflow_id,
+                workflow.broker_order_id,
+            )
+            return EntrySubmissionOutcome(
+                symbol=target_symbol,
+                workflow_id=workflow_id,
+                success=True,
+                dry_run=False,
+                order_id=workflow.broker_order_id,
+            )
+
+        if any(item.event == "entry_submission_intent" for item in workflow.transitions):
+            return self._recover_policy_entry_submission(
+                projection=projection,
+                workflow=workflow,
+                plan=plan,
+                logical_action_id=logical_action_id,
+            )
+        if any(item.event == "submission_intent_resolved" for item in workflow.transitions):
+            return EntrySubmissionOutcome(
+                symbol=target_symbol,
+                workflow_id=workflow_id,
+                success=False,
+                dry_run=False,
+                error="policy entry submission has a durable terminal outcome",
+            )
+
+        with _FILL_HANDLING_LOCK:
+            self._record_policy_entry_guard_check(
+                workflow,
+                execution_ready=execution_ready,
+                market_open_check=market_open_check,
+            )
+            workflow.mark_order_submission_intent(
+                client_order_id=workflow_id,
+                qty=plan.qty,
+                limit_price=plan.entry_price,
+            )
+            result = submit_bracket_buy(
+                symbol=target_symbol,
+                qty=plan.qty,
+                stop_loss_pct=plan.stop_loss_pct,
+                limit_price=plan.entry_price,
+                client_order_id=workflow_id,
+            )
+            if result.success:
+                workflow.mark_order_submitted(broker_order_id=result.order_id)
+                projection = self._policy_store.load_action_projection(logical_action_id)
+                self._bind_policy_broker_reference(
+                    logical_action_id,
+                    projection,
+                    workflow_id,
+                    result.order_id,
+                )
+            elif not result.outcome_uncertain:
+                workflow.mark_order_submit_failed(error=result.error or "unknown order submission error")
+                workflow.mark_submission_intent_resolved(
+                    role="entry",
+                    client_order_id=workflow_id,
+                    outcome="definitive_failure",
+                )
+
+        if result.success:
+            notification_sent = notify_entry_submitted(
+                symbol=target_symbol,
+                qty=plan.qty,
+                entry_price=plan.entry_price,
+                stop_price=float(projection.reservation_stop_price),
+                position_value=plan.position_value,
+                risk_amount=plan.risk_amount,
+                price_source=plan.price_source,
+                order_id=result.order_id,
+                workflow_id=workflow_id,
+                stop_loss_pct=plan.stop_loss_pct,
+                paper=self._paper,
+            )
+            with _FILL_HANDLING_LOCK:
+                workflow.mark_entry_notification(sent=notification_sent)
+            return EntrySubmissionOutcome(
+                symbol=target_symbol,
+                workflow_id=workflow_id,
+                success=True,
+                dry_run=False,
+                order_id=result.order_id,
+            )
+        return EntrySubmissionOutcome(
+            symbol=target_symbol,
+            workflow_id=workflow_id,
+            success=False,
+            dry_run=False,
+            error=result.error,
+            outcome_uncertain=result.outcome_uncertain,
+        )
+
+    @staticmethod
+    def _policy_workflow_id(symbol: str, logical_action_id: str) -> str:
+        symbol_part = "".join(char for char in symbol.lower() if char.isalnum())[:6]
+        suffix = hashlib.sha256(logical_action_id.encode("utf-8")).hexdigest()[:24]
+        return f"cslm-{symbol_part}-{suffix}"
+
+    @staticmethod
+    def _policy_provider_id(projection: Any) -> str:
+        return f"paper-broker:{projection.deployment_identity.execution_profile_id}"
+
+    @staticmethod
+    def _policy_signal_payload(projection: Any) -> dict[str, Any]:
+        return {
+            "policy_generation_id": projection.deployment_generation_id,
+            "decision_id": projection.decision_id,
+            "logical_action_id": projection.logical_action_id,
+            "role": projection.role.value,
+            "target_stop_price": str(projection.reservation_stop_price),
+        }
+
+    @staticmethod
+    def _validate_policy_entry_guard_callbacks(
+        *,
+        dry_run: bool,
+        execution_ready: Callable[[], bool] | None,
+        market_open_check: Callable[[], bool] | None,
+    ) -> None:
+        """Require explicit dynamic guard sources before any live handoff writes."""
+        if dry_run:
+            return
+        if not callable(execution_ready):
+            raise RuntimeError("policy entry submission requires an execution readiness callback")
+        if settings.ENTRY_MARKET_HOURS_ONLY and not callable(market_open_check):
+            raise RuntimeError(
+                "policy entry submission requires a market-open callback while ENTRY_MARKET_HOURS_ONLY is enabled"
+            )
+
+    @staticmethod
+    def _record_policy_entry_guard_check(
+        workflow: Any,
+        *,
+        execution_ready: Callable[[], bool] | None,
+        market_open_check: Callable[[], bool] | None,
+    ) -> None:
+        """Re-check readiness and configured market hours at the submit boundary."""
+        details: dict[str, Any] = {
+            "market_hours_required": bool(settings.ENTRY_MARKET_HOURS_ONLY),
+            "execution_ready": False,
+            "market_open": None,
+        }
+        failure_reason = ""
+        try:
+            details["execution_ready"] = bool(execution_ready()) if execution_ready else False
+        except Exception as exc:  # noqa: BLE001
+            failure_reason = f"execution readiness callback failed: {type(exc).__name__}"
+        if not failure_reason and not details["execution_ready"]:
+            failure_reason = "execution readiness callback denied the entry"
+
+        if settings.ENTRY_MARKET_HOURS_ONLY:
+            try:
+                details["market_open"] = bool(market_open_check()) if market_open_check else False
+            except Exception as exc:  # noqa: BLE001
+                if not failure_reason:
+                    failure_reason = f"market-open callback failed: {type(exc).__name__}"
+            if not failure_reason and not details["market_open"]:
+                failure_reason = "market-open callback denied the entry"
+
+        if failure_reason:
+            details["reason"] = failure_reason
+            workflow.transition(
+                workflow.state,
+                event="policy_entry_guard_blocked",
+                details=details,
+            )
+            raise RuntimeError(f"Policy entry blocked by execution guards: {failure_reason}")
+
+        workflow.transition(
+            workflow.state,
+            event="policy_entry_guards_passed",
+            details=details,
+        )
+
+    def _create_or_resume_policy_entry_workflow(
+        self,
+        *,
+        projection: Any,
+        plan: EntryExecutionPlan,
+        workflow_id: str,
+    ) -> Any:
+        """Create or finish a signal-only workflow without changing its identity."""
+        workflow = get_workflow(workflow_id)
+        if workflow is None:
+            return create_entry_workflow(
+                plan,
+                signal_payload=self._policy_signal_payload(projection),
+                workflow_id=workflow_id,
+            )
+        if workflow.workflow_id != workflow_id or workflow.symbol.strip().upper() != plan.symbol.strip().upper():
+            raise ValueError("recovered execution workflow identity differs from the policy action")
+
+        expected_signal = self._policy_signal_payload(projection)
+        signal_transitions = [
+            item for item in workflow.transitions if item.event == "signal_accepted"
+        ]
+        if len(signal_transitions) != 1:
+            raise ValueError("recovered policy workflow has conflicting signal identity")
+        signal = signal_transitions[0].details.get("signal", {})
+        if not isinstance(signal, dict) or any(
+            signal.get(key) != value for key, value in expected_signal.items()
+        ):
+            raise ValueError("recovered execution workflow signal differs from the policy action")
+
+        plan_transitions = [
+            item for item in workflow.transitions if item.event == "plan_built"
+        ]
+        if workflow.entry_plan is None:
+            if (
+                workflow.state is not WorkflowState.SIGNAL_ACCEPTED
+                or len(workflow.transitions) != 1
+                or plan_transitions
+                or workflow.broker_order_id
+            ):
+                raise ValueError("recovered policy workflow is incomplete outside the signal-only state")
+            workflow.mark_plan_built(plan)
+            return workflow
+
+        if workflow.entry_plan != plan:
+            raise ValueError("recovered execution workflow plan differs from the policy action")
+        if (
+            len(plan_transitions) != 1
+            or plan_transitions[0].details.get("plan") != asdict(plan)
+        ):
+            raise ValueError("recovered execution workflow has conflicting persisted plan facts")
+        return workflow
+
+    def _bind_policy_broker_reference(
+        self,
+        logical_action_id: str,
+        projection: Any,
+        client_order_id: str,
+        broker_order_id: str,
+    ) -> None:
+        if self._policy_store is None:
+            raise RuntimeError("policy store disappeared during order-reference persistence")
+        current = self._policy_store.load_action_projection(logical_action_id)
+        attempt = current.order_attempts[0]
+        if attempt.broker_order_id == broker_order_id:
+            return
+        if attempt.broker_order_id is not None:
+            raise ValueError("policy action is already bound to a different broker order id")
+        self._policy_store.bind_attempt_order_refs(
+            logical_action_id,
+            1,
+            provider_id=self._policy_provider_id(current),
+            broker_order_id=broker_order_id,
+            expected_action_version=int(current.state_version or 0),
+            observed_at=datetime.now(UTC),
+        )
+
+    def _recover_policy_entry_submission(
+        self,
+        *,
+        projection: Any,
+        workflow: Any,
+        plan: EntryExecutionPlan,
+        logical_action_id: str,
+    ) -> EntrySubmissionOutcome:
+        client_order_id = workflow.workflow_id
+        try:
+            order = _get_trading_client().get_order_by_client_id(client_order_id)
+        except Exception as exc:  # noqa: BLE001
+            return EntrySubmissionOutcome(
+                symbol=projection.broker_symbol,
+                workflow_id=workflow.workflow_id,
+                success=False,
+                dry_run=False,
+                error=f"entry submission outcome remains unresolved: {exc}",
+                outcome_uncertain=True,
+            )
+        order_id = str(getattr(order, "id", "") or "").strip()
+        observed_client_id = str(getattr(order, "client_order_id", "") or "").strip()
+        observed_symbol = str(getattr(order, "symbol", "") or "").strip().upper()
+        observed_side = str(getattr(order, "side", "")).split(".")[-1].strip().lower()
+        if (
+            not order_id
+            or observed_client_id != client_order_id
+            or observed_symbol != plan.symbol.strip().upper()
+            or observed_side != "buy"
+        ):
+            return EntrySubmissionOutcome(
+                symbol=projection.broker_symbol,
+                workflow_id=workflow.workflow_id,
+                success=False,
+                dry_run=False,
+                error="exact client-id lookup returned conflicting entry identity",
+                outcome_uncertain=True,
+            )
+        workflow.mark_order_submitted(broker_order_id=order_id)
+        current = self._policy_store.load_action_projection(logical_action_id)
+        self._bind_policy_broker_reference(logical_action_id, current, client_order_id, order_id)
+        return EntrySubmissionOutcome(
+            symbol=projection.broker_symbol,
+            workflow_id=workflow.workflow_id,
+            success=True,
+            dry_run=False,
+            order_id=order_id,
+        )
 
     @staticmethod
     def _addition_account_snapshot(ports: AdditionExecutionPorts) -> BrokerAccountSnapshot:
@@ -468,6 +1013,7 @@ class OrderManager:
             workflow.mark_exit_order_submitted(
                 exit_reason=exit_reason,
                 broker_order_id=result.order_id,
+                requested_quantity=result.qty,
             )
         elif not result.success:
             if result.outcome_uncertain:
@@ -1040,7 +1586,24 @@ class OrderManager:
             position=position,
         )
         cumulative = self._cumulative_workflow_buy_fill(current_workflow)
-        protection = ensure_protective_stop(
+        policy_action_id = self._workflow_policy_action_id(current_workflow)
+        policy_protection = None
+        if policy_action_id:
+            if self._policy_store is None:
+                raise RuntimeError(
+                    "policy-linked workflow requires an explicit policy store for protection"
+                )
+            policy_protection = self.reconcile_policy_protection(
+                policy_action_id,
+                workflow_id=current_workflow.workflow_id,
+                average_entry_price=Decimal(str(position.avg_entry_price)),
+                entry_order_id=cumulative[3] or None,
+                entry_order_ids=cumulative[2] or None,
+                durable_sell_fill_qty=Decimal(
+                    str(self._cumulative_workflow_sell_fill_qty(current_workflow))
+                ),
+            )
+        protection = policy_protection or ensure_protective_stop(
             symbol=symbol,
             qty=position.qty,
             fill_price=position.avg_entry_price,
@@ -1051,19 +1614,18 @@ class OrderManager:
                 current_workflow
             ),
         )
-        self._record_protective_stop(
-            current_workflow,
-            protection,
-            action=f"sell_{normalized_status}_{protection.action}",
-        )
+        if policy_protection is None:
+            self._record_protective_stop(
+                current_workflow,
+                protection,
+                action=f"sell_{normalized_status}_{protection.action}",
+            )
         if protection.success:
             return
 
-        if protection.action == "submission_unknown":
-            raise RuntimeError(
-                f"Safety remains unproven for {symbol}: "
-                f"{protection.error or protection.action}"
-            )
+        _raise_for_non_definite_protection_failure(
+            symbol=symbol, protection=protection
+        )
 
         normalized_order_type = (
             str(order_type).split(".")[-1].strip().lower() or "sell"
@@ -1254,6 +1816,15 @@ class OrderManager:
                 new_checkpoint = True
 
         cumulative = self._cumulative_workflow_buy_fill(workflow)
+        if cumulative[0] > 0 and cumulative[3]:
+            self._record_workflow_policy_fill(
+                workflow,
+                side="buy",
+                broker_order_id=cumulative[3],
+                client_order_id=workflow.workflow_id,
+                cumulative_quantity=cumulative[0],
+                average_fill_price=cumulative[1],
+            )
         source_sell_qty = self._cumulative_workflow_sell_fill_qty(workflow)
         source_net_qty = max(0.0, cumulative[0] - source_sell_qty)
         required_active_floor = 0.0
@@ -1431,7 +2002,24 @@ class OrderManager:
             if item.event == "protective_stop_reconciled"
         ]
         latest_protection = protection_events[-1] if protection_events else None
-        protection = ensure_protective_stop(
+        policy_action_id = self._workflow_policy_action_id(active_workflow)
+        policy_protection = None
+        if policy_action_id:
+            if self._policy_store is None:
+                raise RuntimeError(
+                    "policy-linked workflow requires an explicit policy store for protection"
+                )
+            policy_protection = self.reconcile_policy_protection(
+                policy_action_id,
+                workflow_id=active_workflow.workflow_id,
+                average_entry_price=Decimal(str(active_entry_price)),
+                entry_order_id=active_entry_order_id or None,
+                entry_order_ids=active_entry_order_ids or None,
+                durable_sell_fill_qty=Decimal(
+                    str(self._cumulative_workflow_sell_fill_qty(active_workflow))
+                ),
+            )
+        protection = policy_protection or ensure_protective_stop(
             symbol=symbol,
             qty=active_qty,
             fill_price=active_entry_price,
@@ -1442,30 +2030,25 @@ class OrderManager:
                 active_workflow
             ),
         )
-        if self._same_persisted_protection(latest_protection, protection):
-            active_workflow.repair_protective_stop_reference(
-                stop_order_id=protection.order_id,
-                stop_client_order_id=str(
-                    getattr(protection, "client_order_id", "") or ""
-                ),
-            )
-        else:
-            self._record_protective_stop(
-                active_workflow,
-                protection,
-                action=(f"partial_{protection.action}" if partial else protection.action),
-            )
+        if policy_protection is None:
+            if self._same_persisted_protection(latest_protection, protection):
+                active_workflow.repair_protective_stop_reference(
+                    stop_order_id=protection.order_id,
+                    stop_client_order_id=str(
+                        getattr(protection, "client_order_id", "") or ""
+                    ),
+                )
+            else:
+                self._record_protective_stop(
+                    active_workflow,
+                    protection,
+                    action=(f"partial_{protection.action}" if partial else protection.action),
+                )
 
         if not protection.success:
-            if protection.action in {
-                "position_not_visible",
-                "position_sync_pending",
-                "submission_unknown",
-            }:
-                raise RuntimeError(
-                    f"Safety remains unproven for {symbol}: "
-                    f"{protection.error or protection.action}"
-                )
+            _raise_for_non_definite_protection_failure(
+                symbol=symbol, protection=protection
+            )
             exit_result = self._submit_exit_locked(
                 symbol,
                 exit_reason="protective stop reconciliation failed",
@@ -1636,6 +2219,66 @@ class OrderManager:
                         "changed during the broker-flat proof"
                     )
 
+        policy_action_id = self._workflow_policy_action_id(workflow)
+        if policy_action_id and self._policy_store is not None and filled_qty > 0:
+            policy_action = self._policy_store.load_action_projection(policy_action_id)
+            normalized_sell_order_type = (
+                str(order_type).split(".")[-1].strip().lower()
+            )
+            if policy_action.side is OrderSide.BUY:
+                if normalized_sell_order_type in {"stop", "stop_limit"}:
+                    self._record_policy_protective_sell_checkpoint(
+                        workflow,
+                        logical_action_id=policy_action_id,
+                        broker_order_id=broker_order_id,
+                        client_order_id=client_order_id,
+                        cumulative_quantity=Decimal(str(filled_qty)),
+                        average_fill_price=Decimal(str(fill_price)),
+                    )
+                else:
+                    provenance = self._workflow_guard_sell_provenance(
+                        workflow,
+                        symbol=symbol,
+                        broker_order_id=broker_order_id,
+                        client_order_id=client_order_id,
+                    )
+                    if provenance is None:
+                        self._record_policy_unresolved_sell_checkpoint(
+                            workflow,
+                            logical_action_id=policy_action_id,
+                            broker_order_id=broker_order_id,
+                            client_order_id=client_order_id,
+                            order_type=normalized_sell_order_type,
+                            cumulative_quantity=Decimal(str(filled_qty)),
+                            average_fill_price=Decimal(str(fill_price)),
+                            cause=(
+                                "non-STOP SELL fill has no unique durable exit intent, "
+                                "cause, and submitted quantity"
+                            ),
+                        )
+                    self._record_policy_guard_sell_checkpoint(
+                        workflow,
+                        logical_action_id=policy_action_id,
+                        broker_order_id=broker_order_id,
+                        client_order_id=client_order_id,
+                        order_type=normalized_sell_order_type,
+                        execution_cause=provenance[0],
+                        requested_quantity=provenance[1],
+                        cumulative_quantity=Decimal(str(filled_qty)),
+                        average_fill_price=Decimal(str(fill_price)),
+                    )
+            elif policy_action.side is OrderSide.SELL:
+                policy_sell_fill = self._cumulative_workflow_sell_fill_facts(workflow)
+                if policy_sell_fill[0] > 0 and policy_sell_fill[1] > 0 and policy_sell_fill[2]:
+                    self._record_workflow_policy_fill(
+                        workflow,
+                        side="sell",
+                        broker_order_id=policy_sell_fill[2],
+                        client_order_id=client_order_id,
+                        cumulative_quantity=policy_sell_fill[0],
+                        average_fill_price=policy_sell_fill[1],
+                    )
+
         if position is not None:
             current_workflow = self._repair_broker_position_owner(
                 symbol=symbol,
@@ -1643,7 +2286,24 @@ class OrderManager:
                 position=position,
             )
             cumulative = self._cumulative_workflow_buy_fill(current_workflow)
-            protection = ensure_protective_stop(
+            policy_action_id = self._workflow_policy_action_id(current_workflow)
+            policy_protection = None
+            if policy_action_id:
+                if self._policy_store is None:
+                    raise RuntimeError(
+                        "policy-linked workflow requires an explicit policy store for protection"
+                    )
+                policy_protection = self.reconcile_policy_protection(
+                    policy_action_id,
+                    workflow_id=current_workflow.workflow_id,
+                    average_entry_price=Decimal(str(position.avg_entry_price)),
+                    entry_order_id=cumulative[3] or None,
+                    entry_order_ids=cumulative[2] or None,
+                    durable_sell_fill_qty=Decimal(
+                        str(self._cumulative_workflow_sell_fill_qty(current_workflow))
+                    ),
+                )
+            protection = policy_protection or ensure_protective_stop(
                 symbol=symbol,
                 qty=position.qty,
                 fill_price=position.avg_entry_price,
@@ -1654,21 +2314,20 @@ class OrderManager:
                     current_workflow
                 ),
             )
-            self._record_protective_stop(
-                current_workflow,
-                protection,
-                action=(
-                    f"sell_partial_{protection.action}"
-                    if partial
-                    else f"sell_residual_{protection.action}"
-                ),
-            )
+            if policy_protection is None:
+                self._record_protective_stop(
+                    current_workflow,
+                    protection,
+                    action=(
+                        f"sell_partial_{protection.action}"
+                        if partial
+                        else f"sell_residual_{protection.action}"
+                    ),
+                )
             if not protection.success:
-                if protection.action == "submission_unknown":
-                    raise RuntimeError(
-                        f"Safety remains unproven for {symbol}: "
-                        f"{protection.error or protection.action}"
-                    )
+                _raise_for_non_definite_protection_failure(
+                    symbol=symbol, protection=protection
+                )
                 exit_result = self._submit_exit_locked(
                     symbol,
                     exit_reason="residual position protection failed",
@@ -1747,8 +2406,16 @@ class OrderManager:
     @staticmethod
     def _cumulative_workflow_sell_fill_qty(workflow: Any) -> float:
         """Aggregate sell checkpoints once per identified replacement order."""
-        by_order: dict[str, float] = {}
-        for transition in workflow.transitions:
+        return OrderManager._cumulative_workflow_sell_fill_facts(workflow)[0]
+
+    @staticmethod
+    def _cumulative_workflow_sell_fill_facts(
+        workflow: Any,
+    ) -> tuple[float, float, str]:
+        """Return cumulative sell quantity, weighted price and latest order id."""
+        by_order: dict[str, tuple[float, float, int]] = {}
+        missing_price = False
+        for index, transition in enumerate(getattr(workflow, "transitions", ())):
             if transition.event not in {
                 "sell_partial_fill_received",
                 "sell_fill_received",
@@ -1759,12 +2426,539 @@ class OrderManager:
                 continue
             try:
                 quantity = float(transition.details.get("qty", 0.0) or 0.0)
+                price = float(transition.details.get("fill_price", 0.0) or 0.0)
             except (TypeError, ValueError) as exc:
                 raise RuntimeError("Durable sell fill quantity is invalid") from exc
-            if not math.isfinite(quantity) or quantity < 0:
+            if (
+                not math.isfinite(quantity)
+                or quantity < 0
+                or not math.isfinite(price)
+                or price < 0
+            ):
                 raise RuntimeError("Durable sell fill quantity is invalid")
-            by_order[order_id] = max(by_order.get(order_id, 0.0), quantity)
-        return sum(by_order.values())
+            if quantity > 0 and price <= 0:
+                missing_price = True
+            previous = by_order.get(order_id)
+            if previous is None or quantity > previous[0] + 0.0001 or (
+                abs(quantity - previous[0]) <= 0.0001 and index > previous[2]
+            ):
+                by_order[order_id] = (quantity, price, index)
+        if not by_order:
+            return 0.0, 0.0, ""
+        total_quantity = sum(item[0] for item in by_order.values())
+        if total_quantity <= 0:
+            return 0.0, 0.0, ""
+        weighted_price = (
+            0.0
+            if missing_price
+            else sum(quantity * price for quantity, price, _ in by_order.values())
+            / total_quantity
+        )
+        latest_order_id = max(by_order, key=lambda key: by_order[key][2])
+        return total_quantity, weighted_price, latest_order_id
+
+    @staticmethod
+    def _workflow_policy_action_id(workflow: Any) -> str | None:
+        """Return the policy action durably attached to this workflow, if any."""
+        for transition in reversed(getattr(workflow, "transitions", ())):
+            if transition.event != "signal_accepted":
+                continue
+            signal = transition.details.get("signal", {})
+            logical_action_id = str(
+                signal.get("logical_action_id", "") if isinstance(signal, dict) else ""
+            ).strip()
+            return logical_action_id or None
+        return None
+
+    @staticmethod
+    def _workflow_guard_sell_provenance(
+        workflow: Any,
+        *,
+        symbol: str,
+        broker_order_id: str,
+        client_order_id: str,
+    ) -> tuple[str, Decimal] | None:
+        """Resolve a non-STOP fill only from one paired durable exit intent and submit."""
+        expected_client = build_exit_client_order_id(str(workflow.workflow_id))
+        if not client_order_id or client_order_id != expected_client:
+            return None
+        transitions = tuple(getattr(workflow, "transitions", ()))
+        matches: list[tuple[str, Decimal]] = []
+        normalized_symbol = symbol.strip().upper()
+        for submitted_index, submitted in enumerate(transitions):
+            if submitted.event != "exit_order_submitted":
+                continue
+            submitted_details = submitted.details
+            if str(submitted_details.get("broker_order_id", "") or "") != broker_order_id:
+                continue
+            raw_target = submitted_details.get("requested_quantity")
+            try:
+                target = Decimal(str(raw_target))
+            except Exception:  # noqa: BLE001
+                continue
+            if not target.is_finite() or target <= 0:
+                continue
+            reason = str(submitted_details.get("exit_reason", "") or "").strip()
+            if not reason:
+                continue
+            paired_intents = [
+                transition
+                for transition in transitions[:submitted_index]
+                if transition.event == "exit_submission_intent"
+                and str(transition.details.get("symbol", "") or "").strip().upper()
+                == normalized_symbol
+                and str(transition.details.get("side", "") or "").strip().lower()
+                == "sell"
+                and str(transition.details.get("client_order_id", "") or "")
+                == client_order_id
+                and str(transition.details.get("exit_reason", "") or "").strip()
+                == reason
+            ]
+            if len(paired_intents) == 1:
+                matches.append((reason, target))
+        return matches[0] if len(matches) == 1 else None
+
+    @staticmethod
+    def _workflow_sell_fill_observed_at(
+        workflow: Any,
+        *,
+        broker_order_id: str,
+        client_order_id: str,
+    ) -> datetime:
+        for transition in reversed(getattr(workflow, "transitions", ())):
+            if transition.event not in {"sell_fill_received", "sell_partial_fill_received"}:
+                continue
+            if (
+                str(transition.details.get("broker_order_id", "") or "") != broker_order_id
+                or str(transition.details.get("client_order_id", "") or "")
+                != client_order_id
+            ):
+                continue
+            try:
+                observed_at = datetime.fromisoformat(
+                    str(transition.timestamp_utc).replace("Z", "+00:00")
+                )
+            except ValueError:
+                break
+            if observed_at.tzinfo is not None and observed_at.utcoffset() is not None:
+                return observed_at
+            break
+        return datetime.now(UTC)
+
+    def _record_policy_guard_sell_checkpoint(
+        self,
+        workflow: Any,
+        *,
+        logical_action_id: str,
+        broker_order_id: str,
+        client_order_id: str,
+        order_type: str,
+        execution_cause: str,
+        requested_quantity: Decimal,
+        cumulative_quantity: Decimal,
+        average_fill_price: Decimal,
+    ) -> Any:
+        if self._policy_store is None:
+            raise RuntimeError("policy-linked guard SELL requires an explicit policy store")
+        source = self._policy_store.load_action_projection(logical_action_id)
+        if source.side is not OrderSide.BUY:
+            raise ValueError("execution-guard SELL source must be the workflow's BUY action")
+        if source.holding_episode_id is None:
+            raise RuntimeError("policy-linked guard SELL has no durable holding; reconciliation is required")
+        holding = self._policy_store.load_holding_episode(source.holding_episode_id)
+        observed_at = self._workflow_sell_fill_observed_at(
+            workflow,
+            broker_order_id=broker_order_id,
+            client_order_id=client_order_id,
+        )
+        bridge = PolicyProtectionBridge(
+            self._policy_store,
+            provider_id=self._policy_provider_id(source),
+        )
+        projection = bridge.record_execution_guard_sell_fill(
+            logical_action_id,
+            workflow_id=str(workflow.workflow_id),
+            broker_order_id=broker_order_id,
+            client_order_id=client_order_id,
+            order_type=order_type,
+            execution_cause=execution_cause,
+            requested_quantity=requested_quantity,
+            cumulative_quantity=cumulative_quantity,
+            average_fill_price=average_fill_price,
+            expected_holding_version=int(holding.state_version or 0),
+            observed_at=observed_at,
+        )
+        if projection.status is ActionStatus.RECONCILIATION_REQUIRED:
+            raise RuntimeError(
+                f"Policy-linked guard SELL {broker_order_id} requires position reconciliation"
+            )
+        return projection
+
+    def _record_policy_unresolved_sell_checkpoint(
+        self,
+        workflow: Any,
+        *,
+        logical_action_id: str,
+        broker_order_id: str,
+        client_order_id: str,
+        order_type: str,
+        cumulative_quantity: Decimal,
+        average_fill_price: Decimal,
+        cause: str,
+    ) -> None:
+        if self._policy_store is None:
+            raise RuntimeError("policy-linked SELL requires an explicit policy store")
+        source = self._policy_store.load_action_projection(logical_action_id)
+        if source.side is not OrderSide.BUY:
+            raise ValueError("unresolved execution SELL source must be the workflow's BUY action")
+        if source.holding_episode_id is None:
+            raise RuntimeError(
+                f"Policy-linked SELL {broker_order_id} is retained in workflow history but has no durable holding target; "
+                "position reconciliation is required"
+            )
+        holding = self._policy_store.load_holding_episode(source.holding_episode_id)
+        observed_at = self._workflow_sell_fill_observed_at(
+            workflow,
+            broker_order_id=broker_order_id,
+            client_order_id=client_order_id,
+        )
+        bridge = PolicyProtectionBridge(
+            self._policy_store,
+            provider_id=self._policy_provider_id(source),
+        )
+        bridge.record_unresolved_execution_sell_fact(
+            logical_action_id,
+            workflow_id=str(workflow.workflow_id),
+            broker_order_id=broker_order_id,
+            client_order_id=client_order_id,
+            order_type=order_type,
+            cumulative_quantity=cumulative_quantity,
+            average_fill_price=average_fill_price,
+            unresolved_cause=cause,
+            expected_holding_version=int(holding.state_version or 0),
+            observed_at=observed_at,
+        )
+        raise RuntimeError(
+            f"Policy-linked SELL {broker_order_id} was retained with unresolved execution facts; "
+            f"position reconciliation is required: {cause}"
+        )
+
+    def _record_policy_protective_sell_checkpoint(
+        self,
+        workflow: Any,
+        *,
+        logical_action_id: str,
+        broker_order_id: str,
+        client_order_id: str,
+        cumulative_quantity: Decimal,
+        average_fill_price: Decimal | None,
+    ) -> Any:
+        """Apply a STOP fill to its policy holding or fail with durable reconciliation state."""
+        if self._policy_store is None:
+            raise RuntimeError("policy-linked protective SELL requires an explicit policy store")
+        projection = self._policy_store.load_action_projection(logical_action_id)
+        if projection.side is not OrderSide.BUY:
+            raise ValueError("protective SELL source must be the workflow's BUY holding action")
+        provider_id = self._policy_provider_id(projection)
+        try:
+            holding = self._policy_store.load_holding_episode_for_action(logical_action_id)
+        except KeyError as exc:
+            raise RuntimeError(
+                "policy-linked SELL has no durable holding episode; reconciliation is required"
+            ) from exc
+        timestamp = datetime.now(UTC)
+        for transition in reversed(getattr(workflow, "transitions", ())):
+            if transition.event not in {"sell_fill_received", "sell_partial_fill_received"}:
+                continue
+            if str(transition.details.get("broker_order_id", "") or "") != broker_order_id:
+                continue
+            if str(transition.details.get("client_order_id", "") or "") != client_order_id:
+                continue
+            try:
+                timestamp = datetime.fromisoformat(
+                    str(transition.timestamp_utc).replace("Z", "+00:00")
+                )
+            except ValueError:
+                pass
+            break
+
+        bridge = PolicyProtectionBridge(self._policy_store, provider_id=provider_id)
+        try:
+            return bridge.record_protective_sell_fill(
+                broker_order_id=broker_order_id,
+                client_order_id=client_order_id,
+                cumulative_quantity=cumulative_quantity,
+                average_fill_price=average_fill_price,
+                cumulative_fees=None,
+                expected_holding_version=int(holding.state_version or 0),
+                observed_at=timestamp,
+            )
+        except Exception as exc:  # noqa: BLE001
+            try:
+                latest = self._policy_store.load_holding_episode(holding.holding_episode_id)
+                flags = dict(latest.policy_flags)
+                flags["position_reconciliation_required"] = (
+                    "a policy-linked SELL fill could not be authenticated to one durable protective order"
+                )
+                self._policy_store.record_holding_episode(
+                    replace(latest, policy_flags=tuple(flags.items())),
+                    expected_version=int(latest.state_version or 0),
+                    evidence_ref=(
+                        "broker-sell-reconciliation:"
+                        f"{workflow.workflow_id}:{broker_order_id}:{client_order_id}"
+                    ),
+                )
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"Policy-linked SELL fill {broker_order_id} lacks authenticated protective-order facts; "
+                "position reconciliation is required"
+            ) from exc
+
+    def _recover_policy_protective_stop_fill(
+        self,
+        workflow: Any,
+        *,
+        logical_action_id: str,
+    ) -> None:
+        """Recover an exact confirmed STOP watermark during startup reconciliation."""
+        if self._policy_store is None:
+            raise RuntimeError("policy-linked stop recovery requires an explicit policy store")
+        source_action = self._policy_store.load_action_projection(logical_action_id)
+        if source_action.side is not OrderSide.BUY:
+            return
+        try:
+            holding = self._policy_store.load_holding_episode_for_action(logical_action_id)
+        except KeyError:
+            return
+        broker_order_id = str(holding.confirmed_stop_broker_order_id or "").strip()
+        client_order_id = str(holding.confirmed_stop_client_order_id or "").strip()
+        if not broker_order_id and not client_order_id:
+            return
+        if not broker_order_id or not client_order_id:
+            raise RuntimeError(
+                "confirmed policy STOP is missing one durable broker reference"
+            )
+        try:
+            order = _get_trading_client().get_order_by_id(broker_order_id)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"Exact policy STOP recovery remains unresolved for {broker_order_id}: {exc}"
+            ) from exc
+
+        order_id = str(getattr(order, "id", "") or "").strip()
+        order_client_id = str(getattr(order, "client_order_id", "") or "").strip()
+        order_symbol = str(getattr(order, "symbol", "") or "").strip().upper()
+        order_side = str(getattr(order, "side", "")).split(".")[-1].strip().lower()
+        order_type = str(getattr(order, "type", "")).split(".")[-1].strip().lower()
+        if (
+            order_id != broker_order_id
+            or order_client_id != client_order_id
+            or order_symbol != holding.broker_symbol.strip().upper()
+            or order_side != "sell"
+            or order_type not in {"stop", "stop_limit"}
+        ):
+            raise RuntimeError(
+                "Exact policy STOP recovery returned conflicting broker order facts"
+            )
+
+        try:
+            filled_quantity = Decimal(str(getattr(order, "filled_qty", 0) or 0))
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError("Exact policy STOP recovery returned an invalid fill quantity") from exc
+        if not filled_quantity.is_finite() or filled_quantity < 0:
+            raise RuntimeError("Exact policy STOP recovery returned an invalid fill quantity")
+        if filled_quantity <= 0:
+            return
+
+        average_fill_price: Decimal | None
+        raw_average_price = getattr(order, "filled_avg_price", None)
+        try:
+            average_fill_price = (
+                None
+                if raw_average_price is None or not str(raw_average_price).strip()
+                else Decimal(str(raw_average_price))
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError("Exact policy STOP recovery returned an invalid average price") from exc
+        if average_fill_price is not None and (
+            not average_fill_price.is_finite() or average_fill_price <= 0
+        ):
+            average_fill_price = None
+
+        previous_workflow_quantity = Decimal(
+            str(self._latest_cumulative_sell_fill_qty(workflow, broker_order_id))
+        )
+        if filled_quantity < previous_workflow_quantity:
+            raise RuntimeError(
+                "Exact policy STOP recovery fill watermark regressed below workflow history"
+            )
+        if filled_quantity > previous_workflow_quantity:
+            status = str(getattr(order, "status", "")).split(".")[-1].strip().lower()
+            if status == "filled":
+                workflow.mark_sell_fill(
+                    qty=float(filled_quantity),
+                    fill_price=(
+                        0.0 if average_fill_price is None else float(average_fill_price)
+                    ),
+                    exit_reason="recovered confirmed protective STOP fill",
+                    broker_order_id=broker_order_id,
+                    client_order_id=client_order_id,
+                    clear_active=False,
+                )
+            else:
+                workflow.mark_sell_partial_fill(
+                    qty=float(filled_quantity),
+                    fill_price=(
+                        0.0 if average_fill_price is None else float(average_fill_price)
+                    ),
+                    broker_order_id=broker_order_id,
+                    client_order_id=client_order_id,
+                )
+
+        projection = self._record_policy_protective_sell_checkpoint(
+            workflow,
+            logical_action_id=logical_action_id,
+            broker_order_id=broker_order_id,
+            client_order_id=client_order_id,
+            cumulative_quantity=filled_quantity,
+            average_fill_price=average_fill_price,
+        )
+        if projection.status is ActionStatus.RECONCILIATION_REQUIRED:
+            raise RuntimeError(
+                "Recovered policy STOP fill requires position reconciliation"
+            )
+
+    def _recover_confirmed_policy_stop_fills(
+        self,
+        symbol: str | None,
+    ) -> tuple[Any, ...]:
+        """Recover exact STOP watermarks even when the fill left no broker position."""
+        if self._policy_store is None:
+            return ()
+        recovered = []
+        for target in self._policy_store._load_confirmed_protective_stop_recovery_targets():
+            target_symbol = str(target["symbol"]).strip().upper()
+            if symbol and target_symbol != symbol.strip().upper():
+                continue
+            broker_order_id = str(target["broker_order_id"])
+            client_order_id = str(target["client_order_id"])
+            try:
+                order = _get_trading_client().get_order_by_id(broker_order_id)
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError(
+                    f"Exact policy STOP startup recovery remains unresolved for {broker_order_id}: {exc}"
+                ) from exc
+
+            order_id = str(getattr(order, "id", "") or "").strip()
+            order_client_id = str(getattr(order, "client_order_id", "") or "").strip()
+            order_symbol = str(getattr(order, "symbol", "") or "").strip().upper()
+            order_side = str(getattr(order, "side", "")).split(".")[-1].strip().lower()
+            order_type = str(getattr(order, "type", "")).split(".")[-1].strip().lower()
+            if (
+                order_id != broker_order_id
+                or order_client_id != client_order_id
+                or order_symbol != target_symbol
+                or order_side != "sell"
+                or order_type not in {"stop", "stop_limit"}
+            ):
+                raise RuntimeError(
+                    "Exact policy STOP startup recovery returned conflicting broker facts"
+                )
+            try:
+                cumulative_quantity = Decimal(str(getattr(order, "filled_qty", 0) or 0))
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError(
+                    "Exact policy STOP startup recovery returned an invalid fill quantity"
+                ) from exc
+            if not cumulative_quantity.is_finite() or cumulative_quantity < 0:
+                raise RuntimeError(
+                    "Exact policy STOP startup recovery returned an invalid fill quantity"
+                )
+            if cumulative_quantity <= 0:
+                continue
+            raw_average_price = getattr(order, "filled_avg_price", None)
+            try:
+                average_fill_price = (
+                    None
+                    if raw_average_price is None or not str(raw_average_price).strip()
+                    else Decimal(str(raw_average_price))
+                )
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError(
+                    "Exact policy STOP startup recovery returned an invalid average price"
+                ) from exc
+            if average_fill_price is not None and (
+                not average_fill_price.is_finite() or average_fill_price <= 0
+            ):
+                average_fill_price = None
+
+            bridge = PolicyProtectionBridge(
+                self._policy_store,
+                provider_id=str(target["provider_id"]),
+            )
+            projection = bridge.record_protective_sell_fill(
+                broker_order_id=broker_order_id,
+                client_order_id=client_order_id,
+                cumulative_quantity=cumulative_quantity,
+                average_fill_price=average_fill_price,
+                cumulative_fees=None,
+                expected_holding_version=int(target["state_version"]),
+            )
+            if projection.status is ActionStatus.RECONCILIATION_REQUIRED:
+                raise RuntimeError(
+                    f"Recovered policy STOP fill {broker_order_id} requires position reconciliation"
+                )
+            recovered.append(projection)
+        return tuple(recovered)
+
+    def _record_workflow_policy_fill(
+        self,
+        workflow: Any,
+        *,
+        side: str,
+        broker_order_id: str,
+        client_order_id: str | None,
+        cumulative_quantity: float,
+        average_fill_price: float,
+    ) -> Any | None:
+        """Forward policy-linked workflow fill totals after legacy journaling."""
+        logical_action_id = self._workflow_policy_action_id(workflow)
+        if logical_action_id is None:
+            return None
+        if self._policy_store is None:
+            raise RuntimeError(
+                "policy-linked workflow fill requires an explicit policy store"
+            )
+        projection = self._policy_store.load_action_projection(logical_action_id)
+        if projection.side.value != side:
+            raise RuntimeError(
+                f"policy-linked workflow fill side {side!r} conflicts with its "
+                f"{projection.side.value!r} action; reconciliation is required"
+            )
+        attempts = projection.order_attempts
+        matching = [
+            attempt
+            for attempt in attempts
+            if broker_order_id in attempt.all_broker_order_ids
+            or (client_order_id and client_order_id in attempt.all_client_order_ids)
+        ]
+        if not matching and len(attempts) == 1:
+            matching = [attempts[0]]
+        if len(matching) != 1:
+            raise RuntimeError(
+                f"policy-linked workflow has no unique attempt for {broker_order_id}"
+            )
+        price = Decimal(str(average_fill_price)) if cumulative_quantity > 0 else None
+        return self.record_policy_cumulative_fill(
+            logical_action_id,
+            attempt_number=matching[0].attempt_number,
+            side=side,
+            broker_order_id=broker_order_id,
+            client_order_id=client_order_id,
+            cumulative_quantity=Decimal(str(cumulative_quantity)),
+            average_fill_price=price,
+        )
 
     @staticmethod
     def _latest_cumulative_buy_fill(
@@ -1773,7 +2967,7 @@ class OrderManager:
     ) -> tuple[int, Any] | None:
         """Return the highest cumulative buy checkpoint for a broker order."""
         candidates: list[tuple[float, int, Any]] = []
-        for index, transition in enumerate(workflow.transitions):
+        for index, transition in enumerate(getattr(workflow, "transitions", ())):
             if transition.event != "buy_fill_received":
                 continue
             transition_order_id = str(
@@ -1797,7 +2991,7 @@ class OrderManager:
     ) -> tuple[float, float, set[str], str]:
         """Aggregate maximum cumulative fills across an entry replacement chain."""
         by_order: dict[str, tuple[float, float, int]] = {}
-        for index, transition in enumerate(workflow.transitions):
+        for index, transition in enumerate(getattr(workflow, "transitions", ())):
             if transition.event != "buy_fill_received":
                 continue
             order_id = str(transition.details.get("broker_order_id", "") or "")
@@ -2331,6 +3525,7 @@ class OrderManager:
                     workflow.mark_exit_order_submitted(
                         exit_reason=exit_reason,
                         broker_order_id=leaf_order_id,
+                        requested_quantity=getattr(chain[-1], "qty", None),
                     )
                     continue
                 unsafe_statuses = {
@@ -2393,6 +3588,7 @@ class OrderManager:
             workflow.mark_exit_order_submitted(
                 exit_reason=exit_reason,
                 broker_order_id=leaf_order_id,
+                requested_quantity=getattr(leaf, "qty", None),
             )
             safety = reconcile_symbol_after_exit_failure(
                 intent_symbol,
@@ -2411,6 +3607,7 @@ class OrderManager:
         target_symbol = str(symbol or "").strip().upper()
         self._reconcile_pending_entry_intents_locked(target_symbol or None)
         self._reconcile_pending_exit_intents_locked(target_symbol or None)
+        self._recover_confirmed_policy_stop_fills(target_symbol or None)
         positions = get_open_positions(raise_on_error=True)
         results: list[ProtectiveStopResult] = []
         for position in positions:
@@ -2436,6 +3633,38 @@ class OrderManager:
                     restore_active=True,
                     preserve_higher_qty=False,
                 )
+            cumulative = self._cumulative_workflow_buy_fill(workflow)
+            policy_action_id = self._workflow_policy_action_id(workflow)
+            if policy_action_id:
+                if self._policy_store is None:
+                    raise RuntimeError(
+                        "policy-linked workflow requires an explicit policy store for startup protection"
+                    )
+                if cumulative[0] > 0 and cumulative[3]:
+                    self._record_workflow_policy_fill(
+                        workflow,
+                        side="buy",
+                        broker_order_id=cumulative[3],
+                        client_order_id=workflow.workflow_id,
+                        cumulative_quantity=cumulative[0],
+                        average_fill_price=cumulative[1],
+                    )
+                self._recover_policy_protective_stop_fill(
+                    workflow,
+                    logical_action_id=policy_action_id,
+                )
+                result = self.reconcile_policy_protection(
+                    policy_action_id,
+                    workflow_id=workflow.workflow_id,
+                    average_entry_price=Decimal(str(position.avg_entry_price)),
+                    entry_order_id=cumulative[3] or None,
+                    entry_order_ids=cumulative[2] or None,
+                    durable_sell_fill_qty=Decimal(
+                        str(self._cumulative_workflow_sell_fill_qty(workflow))
+                    ),
+                )
+                results.append(result)
+                continue
             result = reconcile_symbol_after_exit_failure(
                 position.symbol,
                 workflow_id=workflow.workflow_id,
@@ -2527,7 +3756,24 @@ class OrderManager:
             )
 
         cumulative = self._cumulative_workflow_buy_fill(workflow)
-        protection = ensure_protective_stop(
+        policy_action_id = self._workflow_policy_action_id(workflow)
+        policy_protection = None
+        if policy_action_id:
+            if self._policy_store is None:
+                raise RuntimeError(
+                    "policy-linked workflow requires an explicit policy store for exit recovery"
+                )
+            policy_protection = self.reconcile_policy_protection(
+                policy_action_id,
+                workflow_id=workflow.workflow_id,
+                average_entry_price=Decimal(str(active_entry_price)),
+                entry_order_id=cumulative[3] or None,
+                entry_order_ids=cumulative[2] or None,
+                durable_sell_fill_qty=Decimal(
+                    str(self._cumulative_workflow_sell_fill_qty(workflow))
+                ),
+            )
+        protection = policy_protection or ensure_protective_stop(
             symbol=normalized_symbol,
             qty=active_qty,
             fill_price=active_entry_price,
@@ -2536,11 +3782,12 @@ class OrderManager:
             entry_order_ids=cumulative[2] or None,
             durable_sell_fill_qty=self._cumulative_workflow_sell_fill_qty(workflow),
         )
-        self._record_protective_stop(
-            workflow,
-            protection,
-            action=f"{action}_{protection.action}",
-        )
+        if policy_protection is None:
+            self._record_protective_stop(
+                workflow,
+                protection,
+                action=f"{action}_{protection.action}",
+            )
         # Canceling the protective stop is expected while an exact full-size
         # workflow exit is already working.  That state is safe to monitor to
         # completion and must not poison FillMonitor health.

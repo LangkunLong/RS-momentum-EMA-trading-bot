@@ -8,7 +8,7 @@ import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 from config import settings
@@ -896,3 +896,312 @@ def test_observer_console_output_is_charged_before_emission(
     assert captured.out == "abc\n"
     assert budget.snapshot()["dimension_counts"]["output_bytes"] == 4
     assert budget.snapshot()["evidence_complete"] is False
+
+
+def assert_protective_stop_recovery_obeys_operation_limits() -> None:
+    """Exercise stop recovery, deadline, pass, poll, and cancel limits."""
+    from core import order_execution as oe
+
+    def make_budget(
+        *,
+        exit_wait: float,
+        cancel_verify: float,
+        passes: int,
+        cancels: int,
+        cancel_polls: int = 2,
+    ) -> OperationBudget:
+        payload = _limits_for("lifecycle", admitted=True)
+        dimensions = dict(payload["dimensions"])
+        dimensions.update(
+            {
+                "safety_recovery_passes": passes,
+                "cancel_attempts_per_order": cancels,
+                "eligible_order_ids": 3,
+                "cancel_verification_polls": cancel_polls,
+            }
+        )
+        payload["dimensions"] = dimensions
+        deadlines = dict(payload["deadlines_seconds"])
+        deadlines.update(
+            {"exit_wait_seconds": exit_wait, "cancel_verify_seconds": cancel_verify}
+        )
+        payload["deadlines_seconds"] = deadlines
+        return OperationBudget(OperationManifest.from_mapping(payload))
+
+    pending = oe.ProtectiveStopResult(
+        success=False,
+        order_id="",
+        symbol="SPY",
+        qty=1.0,
+        stop_price=93.0,
+        action="pending_buy",
+    )
+
+    # Without a durable entry identifier, the recovery-pass cap must stop a
+    # second broker inventory and reconciliation cycle.
+    pass_budget = make_budget(
+        exit_wait=2.0, cancel_verify=0.5, passes=1, cancels=1
+    )
+    pass_orders = Mock(return_value=[])
+    pass_reconcile = Mock(return_value=pending)
+    pass_sleep = Mock()
+    pass_clock = iter((0.0, 0.1))
+    with (
+        patch(
+            "core.order_execution.time.monotonic",
+            side_effect=lambda: next(pass_clock),
+        ),
+        patch("core.order_execution.time.sleep", pass_sleep),
+        patch("core.order_execution.get_open_orders", pass_orders),
+        patch("core.order_execution.get_workflow", return_value=None),
+        patch(
+            "core.order_execution.reconcile_symbol_after_exit_failure",
+            pass_reconcile,
+        ),
+        activate_operation_budget(pass_budget),
+    ):
+        pass_result = oe.ensure_protective_stop(
+            "SPY",
+            qty=1.0,
+            fill_price=100.0,
+            stop_loss_pct=0.07,
+            workflow_id="wf-spy-budget-pass-cap",
+        )
+
+    assert pass_result.action == "pending_buy"
+    assert pass_budget.snapshot()["dimension_counts"]["safety_recovery_passes"] == 1
+    pass_orders.assert_called_once()
+    pass_reconcile.assert_called_once()
+    pass_sleep.assert_not_called()
+
+    # A durable entry keeps reconciliation pending until the exit-wait
+    # deadline, which must stop the next recovery inventory pass.
+    deadline_budget = make_budget(
+        exit_wait=0.5, cancel_verify=0.5, passes=2, cancels=1
+    )
+    no_orders = Mock(return_value=[])
+    deadline_reconcile = Mock(return_value=pending)
+    deadline_clock = iter((0.0, 0.1, 0.2, 0.6))
+    with (
+        patch(
+            "core.order_execution.time.monotonic",
+            side_effect=lambda: next(deadline_clock),
+        ),
+        patch("core.order_execution.time.sleep"),
+        patch("core.order_execution.get_open_orders", no_orders),
+        patch("core.order_execution.get_workflow", return_value=None),
+        patch(
+            "core.order_execution._wait_for_terminal_buy_order_chain",
+            return_value=1.0,
+        ) as wait_chain,
+        patch("core.order_execution.reconcile_symbol_after_exit_failure", deadline_reconcile),
+        activate_operation_budget(deadline_budget),
+    ):
+        deadline_result = oe.ensure_protective_stop(
+            "SPY",
+            qty=1.0,
+            fill_price=100.0,
+            stop_loss_pct=0.07,
+            workflow_id="wf-spy-budget-deadline",
+            entry_order_id="entry-deadline",
+        )
+
+    assert deadline_result.action == "reconciliation_failed"
+    assert "exit_wait_seconds cap exceeded" in deadline_result.error
+    deadline_snapshot = deadline_budget.snapshot()
+    assert deadline_snapshot["dimension_counts"]["safety_recovery_passes"] == 1
+    assert deadline_snapshot["denials"] == 1
+    no_orders.assert_called_once()
+    wait_chain.assert_called_once()
+    deadline_reconcile.assert_called_once()
+
+    # Carry an explicit stop override through ensure_protective_stop, its real
+    # reconciliation path, and the real submit_stop_loss wrapper while the
+    # lifecycle budget is active. Broker/persistence lookup boundaries,
+    # stable broker snapshots, and UUID generation are faked; ensure,
+    # reconciliation, submit_stop_loss, and budget accounting stay real.
+    override_budget = make_budget(
+        exit_wait=2.0, cancel_verify=0.5, passes=1, cancels=1
+    )
+    override_workflow_id = "wf-spy-budget-override"
+    override_workflow = SimpleNamespace(
+        workflow_id=override_workflow_id,
+        transitions=[],
+        mark_protective_stop=Mock(),
+    )
+    override_position = oe.PositionSummary("SPY", 1.0, 100.0, 100.0, 0.0)
+    override_stop = SimpleNamespace(
+        id="stop-override-budget",
+        symbol="SPY",
+        side="sell",
+        type="stop",
+        status="new",
+        time_in_force="gtc",
+        qty="1.0",
+        filled_qty="0",
+        stop_price="93.25",
+        client_order_id="",
+    )
+    stop_requests = []
+
+    def submit_override_request(request):
+        stop_requests.append(request)
+        override_stop.client_order_id = request.client_order_id
+        override_stop.stop_price = str(request.stop_price)
+        override_stop.qty = str(request.qty)
+        return override_stop
+
+    override_open_orders = Mock(side_effect=[[], [override_stop]])
+    override_samples = Mock(
+        side_effect=[
+            (override_position, []),
+            (override_position, [override_stop]),
+        ]
+    )
+    with (
+        patch("core.order_execution.get_open_orders", override_open_orders),
+        patch("core.order_execution.get_workflow", return_value=override_workflow),
+        patch(
+            "core.order_execution._latest_unknown_stop_submission",
+            return_value=(override_workflow, None, ""),
+        ),
+        patch("core.order_execution._sample_stable_symbol_state", override_samples),
+        patch(
+            "core.order_execution.get_execution_store",
+            return_value=SimpleNamespace(
+                load_pending_submission_intents=lambda **_: []
+            ),
+        ),
+        patch(
+            "core.order_execution._get_trading_client",
+            return_value=SimpleNamespace(submit_order=submit_override_request),
+        ),
+        patch(
+            "core.order_execution.uuid4",
+            return_value=SimpleNamespace(hex="abcdef123456"),
+        ),
+        activate_operation_budget(override_budget),
+    ):
+        override_result = oe.ensure_protective_stop(
+            "SPY",
+            qty=1.0,
+            fill_price=100.0,
+            stop_loss_pct=0.07,
+            workflow_id=override_workflow_id,
+            stop_price_override=93.25,
+        )
+
+    assert override_result.success is True
+    assert override_result.action == "submitted"
+    assert override_result.order_id == "stop-override-budget"
+    assert override_result.stop_price == 93.25
+    assert len(stop_requests) == 1
+    assert stop_requests[0].symbol == "SPY"
+    assert stop_requests[0].qty == 1.0
+    assert stop_requests[0].stop_price == 93.25
+    assert override_stop.client_order_id == override_result.client_order_id
+    assert override_open_orders.call_count == 2
+    assert override_samples.call_count == 2
+    override_snapshot = override_budget.snapshot()
+    assert override_snapshot["dimension_counts"]["safety_recovery_passes"] == 1
+    assert override_snapshot["eligible_order_ids"] == 1
+    assert override_snapshot["denials"] == 0
+
+    # A repeated BUY reaches the per-order cancel cap. The broker then reports
+    # the order absent twice, proving no second cancel mutation was required.
+    attempt_budget = make_budget(
+        exit_wait=2.0,
+        cancel_verify=2.0,
+        passes=2,
+        cancels=1,
+        cancel_polls=4,
+    )
+    buy_order = SimpleNamespace(id="entry-cancel-cap", side="buy", status="new")
+    open_buy = Mock(side_effect=([buy_order], [buy_order], [buy_order], [], [], []))
+    cancel = Mock()
+    recovered_protection = oe.ProtectiveStopResult(
+        success=True,
+        order_id="stop-existing",
+        symbol="SPY",
+        qty=1.0,
+        stop_price=93.0,
+        action="reused",
+    )
+    with (
+        patch("core.order_execution.time.monotonic", return_value=0.0),
+        patch("core.order_execution.time.sleep"),
+        patch("core.order_execution.get_open_orders", open_buy),
+        patch("core.order_execution.get_workflow", return_value=None),
+        patch(
+            "core.order_execution._wait_for_terminal_buy_order_chain",
+            return_value=1.0,
+        ),
+        patch(
+            "core.order_execution.reconcile_symbol_after_exit_failure",
+            return_value=recovered_protection,
+        ),
+        patch(
+            "core.order_execution._get_trading_client",
+            return_value=SimpleNamespace(cancel_order_by_id=cancel),
+        ),
+        activate_operation_budget(attempt_budget),
+    ):
+        cancel_result = oe.ensure_protective_stop(
+            "SPY",
+            qty=1.0,
+            fill_price=100.0,
+            stop_loss_pct=0.07,
+            workflow_id="wf-spy-budget-cancel",
+        )
+
+    assert cancel_result.success
+    assert cancel_result.action == "reused"
+    assert open_buy.call_count == 6
+    cancel.assert_called_once_with("entry-cancel-cap")
+    cancel_snapshot = attempt_budget.snapshot()
+    assert cancel_snapshot["dimension_counts"]["safety_recovery_passes"] == 1
+    assert cancel_snapshot["dimension_counts"]["cancel_verification_polls"] == 4
+    assert cancel_snapshot["denials"] == 1
+
+    # A separate one-poll budget must deny the next broker poll before it
+    # reads the still-open order or attempts another cancellation.
+    poll_budget = make_budget(
+        exit_wait=2.0,
+        cancel_verify=2.0,
+        passes=2,
+        cancels=1,
+        cancel_polls=1,
+    )
+    poll_order = SimpleNamespace(id="entry-poll-cap", side="buy", status="new")
+    poll_orders = Mock(return_value=[poll_order])
+    poll_cancel = Mock()
+    with (
+        patch("core.order_execution.time.monotonic", return_value=0.0),
+        patch("core.order_execution.time.sleep"),
+        patch("core.order_execution.get_open_orders", poll_orders),
+        patch(
+            "core.order_execution._get_trading_client",
+            return_value=SimpleNamespace(cancel_order_by_id=poll_cancel),
+        ),
+        activate_operation_budget(poll_budget),
+    ):
+        poll_result = oe.ensure_protective_stop(
+            "SPY",
+            qty=1.0,
+            fill_price=100.0,
+            stop_loss_pct=0.07,
+            workflow_id="wf-spy-budget-poll-cap",
+        )
+
+    assert poll_result.action == "reconciliation_failed"
+    assert "cancel_verification_polls cap exceeded" in poll_result.error
+    assert poll_orders.call_count == 2
+    poll_cancel.assert_called_once_with("entry-poll-cap")
+    poll_snapshot = poll_budget.snapshot()
+    assert poll_snapshot["dimension_counts"]["cancel_verification_polls"] == 1
+    assert poll_snapshot["denials"] == 1
+
+
+
+def test_protective_stop_recovery_obeys_operation_limits() -> None:
+    assert_protective_stop_recovery_obeys_operation_limits()

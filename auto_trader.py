@@ -702,6 +702,7 @@ def run_auto_trader(
     *,
     symbol: str | None = None,
     execution_ready: ExecutionReadinessCheck | None = None,
+    policy_orchestrator: object | None = None,
 ) -> AutoTraderCycleResult:
     """Full CANSLIM scan → exit monitoring → entry execution cycle.
 
@@ -712,6 +713,9 @@ def run_auto_trader(
         symbol: One explicit dry-run symbol; configured extra symbols are excluded.
         execution_ready: Dynamic live-monitor readiness check. Required for
             order-enabled execution and propagated to every mutation path.
+        policy_orchestrator: An explicitly selected, identity-bound V3 paper
+            runtime. When supplied, it owns the cycle and legacy scanner defaults
+            are never used as a fallback.
     """
     require_paper_mode()
     if symbol is not None:
@@ -722,6 +726,25 @@ def run_auto_trader(
             raise ValueError("Explicit symbol-scoped runs are dry-run only")
         if not skip_exits:
             raise ValueError("Explicit symbol-scoped runs require exit monitoring to be skipped")
+
+    if policy_orchestrator is not None:
+        if symbol is not None:
+            raise ValueError("an explicit scanner symbol cannot override a selected paper policy")
+        run_policy_cycle = getattr(policy_orchestrator, "run", None)
+        if not callable(run_policy_cycle):
+            raise TypeError("selected paper policy orchestrator is invalid")
+        result = run_policy_cycle(
+            dry_run=dry_run,
+            skip_entries=skip_entries,
+            skip_exits=skip_exits,
+            execution_ready=execution_ready,
+            market_open_check=_is_market_open if settings.ENTRY_MARKET_HOURS_ONLY and not dry_run else None,
+            market_hours_required=bool(settings.ENTRY_MARKET_HOURS_ONLY and not dry_run),
+        )
+        return AutoTraderCycleResult(
+            entered=tuple(result.entered),
+            exited=tuple(result.exited),
+        )
 
     mode_label = "DRY RUN" if dry_run else "paper"
     print("=" * 60)

@@ -222,15 +222,30 @@ class ExecutionWorkflow:
             },
         )
 
-    def mark_exit_order_submitted(self, *, exit_reason: str, broker_order_id: str) -> None:
+    def mark_exit_order_submitted(
+        self,
+        *,
+        exit_reason: str,
+        broker_order_id: str,
+        requested_quantity: float | None = None,
+    ) -> None:
+        if requested_quantity is not None and (
+            not isfinite(float(requested_quantity)) or float(requested_quantity) <= 0
+        ):
+            raise ValueError("requested_quantity must be positive and finite when supplied")
         self.broker_order_id = broker_order_id
         self.transition(
             WorkflowState.EXIT_ORDER_SUBMITTED,
             event="exit_order_submitted",
-            details={
-                "exit_reason": exit_reason,
-                "broker_order_id": broker_order_id,
-            },
+            details=(
+                {
+                    "exit_reason": exit_reason,
+                    "broker_order_id": broker_order_id,
+                    "requested_quantity": float(requested_quantity),
+                }
+                if requested_quantity is not None
+                else {"exit_reason": exit_reason, "broker_order_id": broker_order_id}
+            ),
         )
         self._record_order_reference(
             broker_order_id=broker_order_id,
@@ -798,9 +813,17 @@ def generate_workflow_id(symbol: str) -> str:
     return f"cslm-{symbol_part}-{timestamp}-{suffix}"
 
 
-def create_entry_workflow(plan: EntryExecutionPlan, signal_payload: Optional[dict[str, Any]] = None) -> ExecutionWorkflow:
+def create_entry_workflow(
+    plan: EntryExecutionPlan,
+    signal_payload: Optional[dict[str, Any]] = None,
+    *,
+    workflow_id: str | None = None,
+) -> ExecutionWorkflow:
     """Create and register a new workflow for an actionable entry signal."""
-    workflow = ExecutionWorkflow(workflow_id=generate_workflow_id(plan.symbol), symbol=plan.symbol)
+    workflow = ExecutionWorkflow(
+        workflow_id=workflow_id or generate_workflow_id(plan.symbol),
+        symbol=plan.symbol,
+    )
     workflow.mark_signal_accepted(signal_payload=signal_payload)
     workflow.mark_plan_built(plan)
     register_workflow(workflow)

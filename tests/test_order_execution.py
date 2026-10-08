@@ -31,6 +31,7 @@ import pandas as pd
 import pytest
 
 import core.order_execution as oe
+from core.execution_workflow import build_stop_client_order_id
 from core.order_execution import (
     OrderResult,
     PositionSummary,
@@ -1178,6 +1179,91 @@ class TestEnsureProtectiveStop:
             )
 
         assert result == reused
+
+    def test_exact_recovered_rejected_stop_is_definitive_failure(self) -> None:
+        workflow_id = "wf-spy-recovered-rejection"
+        client_order_id = f"{build_stop_client_order_id(workflow_id)}-a1b2c3"
+        workflow = SimpleNamespace(
+            transitions=[
+                SimpleNamespace(
+                    event="protective_stop_reconciled",
+                    details={
+                        "action": "submission_unknown",
+                        "client_order_id": client_order_id,
+                    },
+                )
+            ]
+        )
+        rejected = _mock_order(
+            "stop-exact-rejected",
+            symbol="SPY",
+            side="sell",
+            order_type="stop",
+            qty=1.0,
+        )
+        rejected.client_order_id = client_order_id
+        rejected.status = "rejected"
+        broker = MagicMock()
+        broker.get_order_by_client_id.return_value = rejected
+
+        with (
+            patch("core.order_execution.get_workflow", return_value=workflow),
+            patch(
+                "core.order_execution._get_trading_client", return_value=broker
+            ),
+        ):
+            result = reconcile_symbol_after_exit_failure(
+                "SPY", workflow_id=workflow_id
+            )
+
+        broker.get_order_by_client_id.assert_called_once_with(client_order_id)
+        assert result.success is False
+        assert result.action == "submit_failed"
+        assert result.outcome_uncertain is False
+        assert result.order_id == "stop-exact-rejected"
+
+
+    def test_stronger_exact_old_stop_is_retained_when_replacement_target_is_weaker(self) -> None:
+        workflow_id = "wf-aapl-old-stop-retained"
+        old_stop = _mock_order(
+            "stop-old-exact",
+            symbol="AAPL",
+            side="sell",
+            order_type="stop",
+            qty=10.0,
+            stop_price=95.0,
+        )
+        old_stop.client_order_id = f"{build_stop_client_order_id(workflow_id)}-original"
+        position = PositionSummary("AAPL", 10.0, 100.0, 101.0, 0.01)
+        workflow = SimpleNamespace(workflow_id=workflow_id)
+        with (
+            patch(
+                "core.order_execution._latest_unknown_stop_submission",
+                return_value=(workflow, None, ""),
+            ),
+            patch(
+                "core.order_execution._sample_stable_symbol_state",
+                return_value=(position, [old_stop]),
+            ),
+            patch(
+                "core.order_execution.get_execution_store",
+                return_value=SimpleNamespace(load_pending_submission_intents=lambda **_: []),
+            ),
+            patch("core.order_execution.submit_stop_loss") as submit,
+        ):
+            result = reconcile_symbol_after_exit_failure(
+                "AAPL",
+                workflow_id=workflow_id,
+                stop_price_override=93.0,
+                minimum_position_qty=10.0,
+            )
+
+        assert result.success is False
+        assert result.action == "stronger_existing_stop_unadopted"
+        assert result.order_id == "stop-old-exact"
+        assert result.client_order_id == old_stop.client_order_id
+        submit.assert_not_called()
+
 
     def test_replaces_stale_stop_with_fill_anchored_stop(self) -> None:
         stale = _mock_order(

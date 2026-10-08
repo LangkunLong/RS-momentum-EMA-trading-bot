@@ -3,3 +3,6 @@ core/strategy_policy/risk.py text eol=lf
 core/strategy_policy/exit.py text eol=lf
 docs/price-identity-transition-evidence-ledger-v1.json text eol=lf
 docs/price-identity-transition-evidence-ledger-v1.sha256 text eol=lf
+tests/fixtures/paper_parity_input.json text eol=lf
+tests/fixtures/paper_parity_policy/** text eol=lf
+tests/paper_verification/corrected_selectors.txt text eol=lf
