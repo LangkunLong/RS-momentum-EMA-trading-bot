@@ -345,6 +345,9 @@ def test_definite_rejection_preserves_holding_and_confirmed_stop(tmp_path):
     assert current.remaining_quantity == holding.remaining_quantity
     assert current.confirmed_stop_broker_order_id == holding.confirmed_stop_broker_order_id
     assert broker.submissions == []
+    cancel = manager.cancel_policy_exit_remainder(action.logical_action_id, ports=_ports(store, broker, decision))
+    assert cancel.disposition == "blocked"
+    assert "no matching partial-cancel receipt" in cancel.reason
 
 
 def test_incomplete_broker_snapshot_blocks_before_any_broker_call(tmp_path):

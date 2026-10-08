@@ -284,7 +284,14 @@ def confirm_policy_exit_cancel(
     if action.role not in {ActionRole.SCALE_OUT, ActionRole.CLOSE} or action.side is not OrderSide.SELL:
         raise ValueError("policy exit cancel requires a fixed sell")
     if action.status is ActionStatus.RESOLVED:
-        return PolicyExitCancel("cancelled", action)
+        attempt = action.order_attempts[0]
+        if (
+            attempt.terminal_status is ActionAttemptStatus.CANCELLED
+            and action.confirmed_filled_quantity > 0
+            and broker.confirms_cancelled_remainder(action)
+        ):
+            return PolicyExitCancel("cancelled", action)
+        return PolicyExitCancel("blocked", action, "resolved sell has no matching partial-cancel receipt")
     if action.status not in {ActionStatus.CANCEL_REQUESTED, ActionStatus.REMAINDER_READY}:
         return PolicyExitCancel("blocked", action, "sell has no pending partial remainder cancel")
     holding = store.load_holding_episode(action.holding_episode_id)
