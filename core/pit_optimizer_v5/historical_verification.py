@@ -1258,6 +1258,8 @@ def _saved_docker_argv_v5(
                 ),
                 "--call-timeout-seconds",
                 str(manifest.resources.policy_method_timeout_seconds),
+                "--startup-timeout-seconds",
+                str(manifest.resources.worker_startup_timeout_seconds),
                 "--output-limit-bytes",
                 str(manifest.resources.evaluation_output_limit_bytes),
             )

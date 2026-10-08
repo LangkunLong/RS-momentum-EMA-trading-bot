@@ -62,6 +62,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--probe-runtime-sha256", required=True)
     parser.add_argument("--probe-runtime-authority-sha256", required=True)
     parser.add_argument("--call-timeout-seconds", required=True, type=float)
+    parser.add_argument("--startup-timeout-seconds", required=True, type=float)
     parser.add_argument("--output-limit-bytes", required=True, type=int)
     return parser
 
@@ -283,6 +284,7 @@ def _write_output(*, content: bytes, maximum_bytes: int) -> None:
 
 
 def main(argv: tuple[str, ...] | None = None) -> int:
+    stage = "arguments"
     try:
         arguments = _parser().parse_args(argv)
         request_sha256 = _digest(arguments.request_sha256, "probe request")
@@ -324,13 +326,16 @@ def main(argv: tuple[str, ...] | None = None) -> int:
             raise ValueError("trusted probe runtime authority differs")
         if arguments.suite_id != PROBE_SUITE_ID_V5:
             raise ValueError("probe suite is invalid")
+        stage = "installed_source"
         from .image_manifest import verify_installed_evaluator_source_v5
 
         verify_installed_evaluator_source_v5(
             source_root=Path(__file__).resolve().parents[2],
             expected_sha256=probe_runtime_sha256,
         )
+        stage = "policy_overlay"
         source = read_policy_source_v5()
+        stage = "policy_revision"
         revision = derive_policy_revision_identity_v5(
             source_bundle=source,
             trusted_policy_runtime_sha256=trusted_runtime_sha256,
@@ -338,8 +343,10 @@ def main(argv: tuple[str, ...] | None = None) -> int:
         )
         if revision.sha256 != expected_policy_sha256:
             raise ValueError("probe policy identity differs")
+        stage = "worker_startup"
         session = PolicyWorkerSessionV5(
             call_timeout_seconds=float(arguments.call_timeout_seconds),
+            startup_timeout_seconds=float(arguments.startup_timeout_seconds),
             source=source,
         )
         client = JsonLinePolicyClient(
@@ -347,6 +354,7 @@ def main(argv: tuple[str, ...] | None = None) -> int:
             interface_version=POLICY_INTERFACE_VERSION_V3,
         )
         try:
+            stage = "fingerprint"
             fingerprint: SemanticFingerprintV5 = fingerprint_policy_client_v5(client)
         finally:
             client.close()
@@ -358,9 +366,22 @@ def main(argv: tuple[str, ...] | None = None) -> int:
                 "suite_id": PROBE_SUITE_ID_V5,
             }
         )
+        stage = "output_write"
         _write_output(content=output, maximum_bytes=arguments.output_limit_bytes)
         return 0
-    except BaseException:
+    except BaseException as exc:
+        error_type = type(exc).__name__
+        if not error_type.isascii() or not error_type.isidentifier() or len(error_type) > 64:
+            error_type = "UnknownError"
+        try:
+            os.write(
+                2,
+                canonical_json_bytes_v5(
+                    {"schema_version": 5, "stage": stage, "error_type": error_type}
+                ) + b"\n",
+            )
+        except BaseException:
+            pass
         return 3
 
 
