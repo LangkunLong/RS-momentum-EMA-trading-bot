@@ -233,8 +233,6 @@ def _confirmed_protection_matches_addition(
     if not matches:
         return False
     provider_id = guard.get("provider_id")
-    if provider_id is None:
-        return True
     if not isinstance(provider_id, str) or not provider_id:
         return False
     try:
@@ -1022,9 +1020,11 @@ def confirm_addition_protection(
     *,
     account: BrokerAccountSnapshot,
     observed_at,
-    provider_id: str | None = None,
+    provider_id: str,
 ) -> AdditionStep:
     """Confirm a replacement only from exact broker position and stop-order facts."""
+    if type(provider_id) is not str or not provider_id.strip():
+        raise ValueError("addition protection requires a provider identity")
     plan, action, step = _execution_context(store, decision_id)
     if action is None or action.confirmed_filled_quantity <= 0:
         return step
@@ -1078,7 +1078,7 @@ def confirm_addition_protection(
         observed_at=observed_at,
         expected_holding_version=holding.state_version,
         provider_id=provider_id,
-        requested_quantity=holding.remaining_quantity if provider_id is not None else None,
+        requested_quantity=holding.remaining_quantity,
     )
     return _step_for_action(store, plan, store.load_action_intent(action.logical_action_id))
 
@@ -1090,7 +1090,7 @@ def replace_addition_protection(
     account: BrokerAccountSnapshot,
     observed_at,
     replace_stop: Callable[..., BrokerAccountSnapshot | None],
-    provider_id: str | None = None,
+    provider_id: str,
 ) -> AdditionStep:
     """Replace protection atomically and confirm it from a fresh account snapshot.
 
@@ -1099,6 +1099,8 @@ def replace_addition_protection(
     is confirmed; exceptions or ``None`` leave the durable old stop unchanged and
     freeze the holding until ``confirm_addition_protection`` receives later facts.
     """
+    if type(provider_id) is not str or not provider_id.strip():
+        raise ValueError("addition protection requires a provider identity")
     plan, action, step = _execution_context(store, decision_id)
     if action is None or action.confirmed_filled_quantity <= 0:
         return step

@@ -774,6 +774,7 @@ def test_partial_and_duplicate_fill_resolves_once_then_resizes_protection_to_exa
         account=after_fill_account,
         observed_at=after_fill_account.clock.valuation_time,
         replace_stop=uncertain_stop_replace,
+        provider_id=_ADD_PROVIDER,
     )
     assert waiting.kind is AdditionStepKind.WAITING_FOR_PROTECTION
     assert len(calls) == 1
@@ -788,6 +789,7 @@ def test_partial_and_duplicate_fill_resolves_once_then_resizes_protection_to_exa
         account=after_fill_account,
         observed_at=after_fill_account.clock.valuation_time,
         replace_stop=uncertain_stop_replace,
+        provider_id=_ADD_PROVIDER,
     )
     assert replay.kind is AdditionStepKind.WAITING_FOR_PROTECTION
     assert len(calls) == 1
@@ -795,11 +797,21 @@ def test_partial_and_duplicate_fill_resolves_once_then_resizes_protection_to_exa
     refreshed_account = _account_after_stop_replacement(
         after_fill_account, plan, holding_quantity=7
     )
+    with pytest.raises(ValueError, match="provider identity"):
+        confirm_addition_protection(
+            store,
+            plan.decision.decision_id,
+            account=refreshed_account,
+            observed_at=refreshed_account.clock.valuation_time,
+            provider_id="",
+        )
+    assert load_addition_intention(store, plan.decision.decision_id).kind is AdditionStepKind.WAITING_FOR_PROTECTION
     protected = confirm_addition_protection(
         store,
         plan.decision.decision_id,
         account=refreshed_account,
         observed_at=refreshed_account.clock.valuation_time,
+        provider_id=_ADD_PROVIDER,
     )
     assert protected.kind is AdditionStepKind.PROTECTED
     final_holding = store.load_holding_episode(original_holding.holding_episode_id)
@@ -810,6 +822,15 @@ def test_partial_and_duplicate_fill_resolves_once_then_resizes_protection_to_exa
     assert final_holding.confirmed_stop_broker_order_id == _STOP_BROKER_ID
     assert final_holding.completed_additions_quantity == original_holding.completed_additions_quantity + 1
     assert final_holding.addition_count == original_holding.addition_count + 1
+    assert store.confirmed_protective_order_quantity(
+        final_holding.confirmed_stop_action_id, provider_id=_ADD_PROVIDER
+    ) == Decimal("7")
+    after_protection_restart = PolicyExecutionStateStore(
+        store.db_path, store_identity=deployment.store_identity
+    )
+    assert load_addition_intention(
+        after_protection_restart, plan.decision.decision_id
+    ).kind is AdditionStepKind.PROTECTED
 
     refreshed_account = _account_after_stop_replacement(
         after_fill_account, plan, holding_quantity=7
