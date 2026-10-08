@@ -323,7 +323,11 @@ def _record_replacement_buy_fill_locked(
         ports.store.record_decision(
             decision,
             policy_payload={"source_action_id": action.logical_action_id},
-            guard_payload={"filled_quantity": str(quantity), "account_snapshot_id": account.account_snapshot_id},
+            guard_payload={
+                "filled_quantity": str(quantity),
+                "account_snapshot_id": account.account_snapshot_id,
+                "provider_id": ports.provider_id,
+            },
             effective_action_payload={"stop_price": str(action.reservation_stop_price)},
         )
         stop_intent = ports.store.propose_stop_update(

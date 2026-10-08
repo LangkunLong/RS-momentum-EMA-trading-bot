@@ -617,11 +617,16 @@ def _confirmed_replacement_buy_stop(
     try:
         stop = store.load_stop_update_intent(stop_id)
         record = store.load_decision_record(stop.decision_id)
+        provider_id = record.guard_payload.get("provider_id")
         return (
             stop.holding_episode_id == holding.holding_episode_id
             and stop.requested_stop_price == buy.reservation_stop_price
             and record.policy_payload.get("source_action_id") == buy.logical_action_id
+            and isinstance(provider_id, str)
+            and bool(provider_id)
             and Decimal(str(record.guard_payload.get("filled_quantity")))
+            == buy.confirmed_filled_quantity
+            and store.confirmed_protective_order_quantity(stop_id, provider_id=provider_id)
             == buy.confirmed_filled_quantity
         )
     except (ValueError, KeyError, TypeError, InvalidOperation):

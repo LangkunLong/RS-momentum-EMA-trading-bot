@@ -317,6 +317,9 @@ def test_partial_buy_restarts_and_resizes_exact_new_holding_stop(tmp_path):
     assert first.action is not None and first.action.status is ActionStatus.PARTIALLY_FILLED
     first_holding = store.load_holding_episode_for_action(first.action.logical_action_id)
     assert first_holding.remaining_quantity == Decimal("30")
+    assert store.confirmed_protective_order_quantity(
+        first_holding.confirmed_stop_action_id, provider_id=ports.provider_id
+    ) == Decimal("30")
     first_stop_id = first_holding.confirmed_stop_broker_order_id
     assert first_stop_id is not None
 
@@ -337,6 +340,9 @@ def test_partial_buy_restarts_and_resizes_exact_new_holding_stop(tmp_path):
     assert final.action is not None
     holding = restarted_store.load_holding_episode_for_action(final.action.logical_action_id)
     assert holding.remaining_quantity == Decimal("64")
+    assert restarted_store.confirmed_protective_order_quantity(
+        holding.confirmed_stop_action_id, provider_id=ports.provider_id
+    ) == Decimal("64")
     assert holding.confirmed_stop_broker_order_id != first_stop_id
     stops = tuple(
         row for row in restarted_broker.snapshot().open_orders
@@ -423,9 +429,13 @@ def test_second_fill_cannot_complete_with_only_first_fill_stop_after_restart(tmp
     )
     waiting = advance_replacement(store, plan.decision.decision_id)
     assert waiting.kind is ReplacementStepKind.WAITING_FOR_RECONCILIATION
-    assert store.load_holding_episode_for_action(
+    prior_holding = store.load_holding_episode_for_action(
         partial.action.logical_action_id
-    ).confirmed_stop_broker_order_id == original_stop
+    )
+    assert prior_holding.confirmed_stop_broker_order_id == original_stop
+    assert store.confirmed_protective_order_quantity(
+        prior_holding.confirmed_stop_action_id, provider_id=ports.provider_id
+    ) == Decimal("30")
 
     restarted_store = PolicyExecutionStateStore(store.db_path, store_identity=deployment.store_identity)
     restarted_broker = FakeProtectedReplacementBuyBroker(
