@@ -1745,6 +1745,118 @@ class PolicyExecutionStateStore:
             )
             return replace(updated, state_version=next_version)
 
+    def record_exit_management_state(
+        self,
+        decision: DecisionIdentity,
+        *,
+        holding_episode_id: str,
+        policy_payload: Mapping[str, object],
+        guard_payload: Mapping[str, object],
+        effective_action_payload: Mapping[str, object],
+        early_winner_hold: bool,
+        breakeven_armed: bool,
+        ema_trailing_active: bool,
+        policy_scale_out_tier: int,
+        peak_price: Decimal,
+        expected_holding_version: int,
+        observed_at: datetime,
+    ) -> HoldingEpisode:
+        """Atomically bind one fixed exit decision to restartable holding flags."""
+        _aware_iso(observed_at)
+        if (
+            decision.category is not DecisionCategory.EXIT
+            or decision.subject_type is not DecisionSubjectType.HOLDING
+            or decision.subject_id != holding_episode_id
+        ):
+            raise ValueError("exit management decision must identify its holding")
+        if any(type(value) is not bool for value in (early_winner_hold, breakeven_armed, ema_trailing_active)):
+            raise TypeError("exit management flags must be boolean")
+        if type(policy_scale_out_tier) is not int or policy_scale_out_tier < 0:
+            raise ValueError("policy scale-out tier must be non-negative")
+        if not isinstance(peak_price, Decimal) or not peak_price.is_finite() or peak_price <= 0:
+            raise ValueError("exit management peak must be a positive Decimal")
+        if type(expected_holding_version) is not int or expected_holding_version < 0:
+            raise ValueError("expected holding version must be non-negative")
+        selected = policy_payload.get("decision")
+        if (
+            policy_payload.get("kind") != "fixed_exit_policy_state_v1"
+            or not isinstance(selected, Mapping)
+            or effective_action_payload.get("kind") != "exit_holding_management_state_v1"
+            or guard_payload.get("expected_holding_version") != expected_holding_version
+            or any(
+                selected.get(name) is not value or effective_action_payload.get(name) is not value
+                for name, value in (
+                    ("early_winner_hold", early_winner_hold),
+                    ("breakeven_armed", breakeven_armed),
+                    ("ema_trailing_active", ema_trailing_active),
+                )
+            )
+            or selected.get("scale_out_tier") != policy_scale_out_tier
+            or effective_action_payload.get("selected_scale_out_tier") != policy_scale_out_tier
+        ):
+            raise ValueError("exit management flags differ from the fixed policy decision")
+        if observed_at < decision.clock.as_of_cutoff_at:
+            raise ValueError("exit management observation precedes the decision cutoff")
+        with self._transaction(write=True) as conn:
+            self._require_ready(conn)
+            row = self._holding_row(conn, _required_text(holding_episode_id, "holding_episode_id"))
+            if row is None:
+                raise KeyError("exit management holding was not found")
+            holding = _holding_from_row(row)
+            if holding.deployment_generation_id != decision.deployment_generation_id:
+                raise ValueError("exit management decision differs from the holding generation")
+            self._record_decision_in_transaction(
+                conn, decision,
+                policy_payload=policy_payload,
+                guard_payload=guard_payload,
+                effective_action_payload=effective_action_payload,
+            )
+            flags = dict(holding.policy_flags)
+            if flags.get("exit_management_decision_id") == decision.decision_id:
+                return holding
+            if flags.get("exit_management_session") == decision.clock.decision_session.isoformat():
+                raise DecisionConflictError("a different exit management decision already owns this session")
+            if int(row["state_version"]) != expected_holding_version:
+                raise ConcurrentStateUpdateError("holding changed since exit management was prepared")
+            if holding.pending_action_ids or holding.remaining_quantity <= 0:
+                raise ValueError("exit management requires a non-flat holding without pending actions")
+            if (
+                bool(flags.get("position_reconciliation_required"))
+                or holding.proposed_stop_action_id != holding.confirmed_stop_action_id
+                or not holding.confirmed_stop_client_order_id
+                or not holding.confirmed_stop_broker_order_id
+            ):
+                raise ValueError("exit management requires a reconciled confirmed protective stop")
+            if holding.last_accepted_session is not None and decision.clock.decision_session < holding.last_accepted_session:
+                raise ValueError("exit management cannot use an earlier session")
+            if holding.valuation_at is not None and observed_at < holding.valuation_at:
+                raise ValueError("exit management valuation cannot move backward")
+            if holding.peak_price is not None and peak_price < holding.peak_price:
+                raise ValueError("exit management peak cannot decrease")
+            flags.update({
+                "exit_management_decision_id": decision.decision_id,
+                "exit_management_session": decision.clock.decision_session.isoformat(),
+                "early_winner_hold": str(early_winner_hold).lower(),
+                "breakeven_armed": str(breakeven_armed).lower(),
+                "ema_trailing_active": str(ema_trailing_active).lower(),
+                "exit_policy_scale_out_tier": str(policy_scale_out_tier),
+            })
+            updated = replace(
+                holding,
+                policy_flags=tuple(flags.items()),
+                peak_price=peak_price,
+                valuation_at=observed_at,
+                last_accepted_session=decision.clock.decision_session,
+            )
+            next_version = self._save_holding(
+                conn, updated,
+                expected_version=expected_holding_version,
+                event_kind="exit_management_state_recorded",
+                evidence_ref=decision.decision_id,
+                observed_at=observed_at,
+            )
+            return replace(updated, state_version=next_version)
+
     def _append_action_history(
         self,
         conn: sqlite3.Connection,

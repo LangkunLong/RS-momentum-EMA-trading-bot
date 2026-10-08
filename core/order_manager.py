@@ -34,6 +34,7 @@ from core.policy_addition import (
 )
 
 from core.fake_policy_exit_broker import FakeProtectedExitBroker
+from core.policy_exit_management import record_fixed_exit_management
 from core.policy_exit_execution import (
     PolicyExitCancel,
     PolicyExitDispatch,
@@ -95,9 +96,10 @@ from core.order_execution import (
     require_paper_mode,
     submit_bracket_buy,
 )
-from core.policy_execution_state import ActionRole, ActionStatus, DecisionIdentity, OrderSide, PortfolioStateSnapshot
+from core.policy_execution_state import ActionRole, ActionStatus, DecisionIdentity, HoldingEpisode, OrderSide, PortfolioStateSnapshot
 from core.policy_execution_store import PolicyExecutionStateStore
 from core.policy_protection_bridge import PolicyProtectionBridge
+from core.strategy_policy.contracts import ExitDecision, ExitSnapshot
 
 
 _FILL_HANDLING_LOCK = threading.RLock()
@@ -1025,6 +1027,28 @@ class OrderManager:
                 provider_id=ports.provider_id,
                 observed_at=ports.observed_at(),
                 broker=ports.broker,
+            )
+
+    def record_policy_exit_management(
+        self,
+        *,
+        decision: DecisionIdentity,
+        holding_episode_id: str,
+        snapshot: ExitSnapshot,
+        outcome: ExitDecision,
+        expected_holding_version: int,
+    ) -> HoldingEpisode:
+        """Persist one fixed exit policy's winner and trailing state before actions."""
+        if self._policy_store is None:
+            raise RuntimeError("exit management requires an explicit policy store")
+        with _FILL_HANDLING_LOCK:
+            return record_fixed_exit_management(
+                self._policy_store,
+                decision=decision,
+                holding_episode_id=holding_episode_id,
+                snapshot=snapshot,
+                outcome=outcome,
+                expected_holding_version=expected_holding_version,
             )
 
     def cancel_policy_exit_remainder(
