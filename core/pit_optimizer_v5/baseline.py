@@ -1143,6 +1143,8 @@ class _LocalBaselineTransportV5:
             ),
             "--call-timeout-seconds",
             str(inputs.resources.policy_method_timeout_seconds),
+            "--startup-timeout-seconds",
+            str(inputs.resources.worker_startup_timeout_seconds),
             "--output-limit-bytes",
             str(inputs.sandbox.output_limit_bytes),
         )
