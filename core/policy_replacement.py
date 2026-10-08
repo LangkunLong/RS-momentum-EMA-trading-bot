@@ -4,7 +4,7 @@ import hashlib
 import json
 from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime, timedelta
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from enum import Enum, StrEnum
 from typing import Mapping
 
@@ -16,6 +16,7 @@ from core.policy_execution_state import (
     DecisionClock,
     DecisionIdentity,
     DecisionSubjectType,
+    HoldingEpisode,
     OrderSide,
     assert_same_logical_action,
     build_action_intent,
@@ -599,6 +600,34 @@ def _flat_stop_retirement_reason(holding, sell: ActionIntent) -> str | None:
     return None
 
 
+def _confirmed_replacement_buy_stop(
+    store: PolicyExecutionStateStore, buy: ActionIntent, holding: HoldingEpisode
+) -> bool:
+    """Require the confirmed stop decision to cover this exact buy watermark."""
+    stop_id = holding.confirmed_stop_action_id
+    if (
+        stop_id is None
+        or stop_id != holding.proposed_stop_action_id
+        or holding.confirmed_stop_client_order_id is None
+        or holding.confirmed_stop_broker_order_id is None
+        or holding.confirmed_protective_stop_price != buy.reservation_stop_price
+        or holding.remaining_quantity != buy.confirmed_filled_quantity
+    ):
+        return False
+    try:
+        stop = store.load_stop_update_intent(stop_id)
+        record = store.load_decision_record(stop.decision_id)
+        return (
+            stop.holding_episode_id == holding.holding_episode_id
+            and stop.requested_stop_price == buy.reservation_stop_price
+            and record.policy_payload.get("source_action_id") == buy.logical_action_id
+            and Decimal(str(record.guard_payload.get("filled_quantity")))
+            == buy.confirmed_filled_quantity
+        )
+    except (ValueError, KeyError, TypeError, InvalidOperation):
+        return False
+
+
 def advance_replacement(
     store: PolicyExecutionStateStore,
     decision_id: str,
@@ -711,13 +740,7 @@ def advance_replacement(
             return ReplacementStep(ReplacementStepKind.BUY_DUE, decision_id, buy)
         if buy.status is ActionStatus.FILLED:
             holding = store.load_holding_episode_for_action(buy.logical_action_id)
-            if (
-                holding.remaining_quantity != buy.confirmed_filled_quantity
-                or holding.proposed_stop_action_id != holding.confirmed_stop_action_id
-                or holding.confirmed_stop_client_order_id is None
-                or holding.confirmed_stop_broker_order_id is None
-                or holding.confirmed_protective_stop_price != buy.reservation_stop_price
-            ):
+            if not _confirmed_replacement_buy_stop(store, buy, holding):
                 return ReplacementStep(
                     ReplacementStepKind.WAITING_FOR_RECONCILIATION,
                     decision_id,

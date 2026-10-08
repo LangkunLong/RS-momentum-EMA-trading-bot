@@ -17,7 +17,11 @@ from core.policy_replacement import (
     load_replacement_intention,
     start_replacement,
 )
-from core.policy_replacement_execution import ReplacementBuyPorts
+from core.policy_replacement_execution import (
+    ReplacementBuyPorts,
+    _client_order_id,
+    _holding_id,
+)
 from core.policy_protection_bridge import PolicyProtectionBridge
 from core.strategy_policy.account_reconciliation import AccountValuationClock, BrokerOrderFact
 from tests.test_policy_replacement import (
@@ -252,6 +256,50 @@ def test_uncertain_buy_acceptance_recovers_once_after_restart(tmp_path):
     assert account.cash == restarted_broker.snapshot().cash
 
 
+def test_matching_order_without_durable_receipt_does_not_reconcile_buy(tmp_path):
+    store, plan, deployment, account, portfolio, broker, ports, receipt_path = _ready_buy(tmp_path)
+    due = advance_replacement(
+        store, plan.decision.decision_id, account=account,
+        portfolio_snapshot=portfolio, candidate_price=Decimal("110"),
+    )
+    assert due.action is not None
+    buy = due.action
+    client_id = _client_order_id(buy.logical_action_id)
+    store.bind_attempt_order_refs(
+        buy.logical_action_id,
+        1,
+        provider_id=ports.provider_id,
+        client_order_id=client_id,
+        expected_action_version=store.load_action_projection(buy.logical_action_id).state_version,
+        observed_at=account.clock.valuation_time,
+    )
+    injected = BrokerOrderFact(
+        broker_order_id="unreceipted-matching-buy",
+        client_order_id=client_id,
+        symbol=buy.broker_symbol,
+        side="buy",
+        status="submitted",
+        requested_quantity=float(buy.requested_quantity),
+        cumulative_filled_quantity=0,
+        purpose="strategy",
+        holding_episode_id=_holding_id(buy),
+    )
+    broker.observe_account(replace(account, open_orders=account.open_orders + (injected,)))
+    restarted_store = PolicyExecutionStateStore(store.db_path, store_identity=deployment.store_identity)
+    restarted_broker = FakeProtectedReplacementBuyBroker(
+        broker.snapshot(), quote_symbol=plan.candidate_symbol,
+        quote_price=Decimal("110"), receipt_store_path=receipt_path,
+    )
+    restarted_ports = replace(ports, store=restarted_store, broker=restarted_broker)
+    waiting = OrderManager(paper=True, policy_store=restarted_store).reconcile_replacement_buy(
+        plan.decision.decision_id, ports=restarted_ports
+    )
+    assert waiting.kind is ReplacementStepKind.WAITING_FOR_BUY
+    assert waiting.action is not None
+    assert waiting.action.order_attempts[0].broker_order_id is None
+    assert restarted_broker.submissions == []
+
+
 def test_partial_buy_restarts_and_resizes_exact_new_holding_stop(tmp_path):
     store, plan, deployment, account, portfolio, broker, ports, receipt_path = _ready_buy(tmp_path)
     manager = OrderManager(paper=True, policy_store=store)
@@ -340,6 +388,58 @@ def test_full_buy_fill_waits_for_durable_stop_confirmation_after_restart(tmp_pat
     assert restarted_store.load_holding_episode_for_action(
         recovered.action.logical_action_id
     ).confirmed_stop_broker_order_id is not None
+
+
+def test_second_fill_cannot_complete_with_only_first_fill_stop_after_restart(tmp_path):
+    store, plan, deployment, account, portfolio, broker, ports, receipt_path = _ready_buy(tmp_path)
+    manager = OrderManager(paper=True, policy_store=store)
+    submitted = manager.submit_replacement_buy(
+        plan.decision.decision_id, portfolio_snapshot=portfolio, ports=ports
+    )
+    assert submitted.submission is not None and submitted.submission.success
+    broker_id = submitted.submission.broker_order_id
+    broker.fill_buy(
+        broker_id, Decimal("30"), fill_price=Decimal("110"),
+        observed_at=account.clock.valuation_time,
+    )
+    partial = manager.record_replacement_buy_fill(plan.decision.decision_id, ports=ports)
+    assert partial.action is not None
+    original_stop = store.load_holding_episode_for_action(
+        partial.action.logical_action_id
+    ).confirmed_stop_broker_order_id
+    broker.fill_buy(
+        broker_id, Decimal("34"), fill_price=Decimal("110"),
+        observed_at=account.clock.valuation_time,
+    )
+    PolicyProtectionBridge(store, provider_id=ports.provider_id).record_cumulative_fill(
+        partial.action.logical_action_id,
+        attempt_number=1,
+        broker_order_id=broker_id,
+        client_order_id=partial.action.order_attempts[0].client_order_id,
+        cumulative_quantity=Decimal("64"),
+        average_fill_price=Decimal("110"),
+        cumulative_fees=Decimal("0"),
+        observed_at=account.clock.valuation_time,
+    )
+    waiting = advance_replacement(store, plan.decision.decision_id)
+    assert waiting.kind is ReplacementStepKind.WAITING_FOR_RECONCILIATION
+    assert store.load_holding_episode_for_action(
+        partial.action.logical_action_id
+    ).confirmed_stop_broker_order_id == original_stop
+
+    restarted_store = PolicyExecutionStateStore(store.db_path, store_identity=deployment.store_identity)
+    restarted_broker = FakeProtectedReplacementBuyBroker(
+        broker.snapshot(), quote_symbol=plan.candidate_symbol,
+        quote_price=Decimal("110"), receipt_store_path=receipt_path,
+    )
+    restarted_ports = replace(ports, store=restarted_store, broker=restarted_broker)
+    recovered = OrderManager(paper=True, policy_store=restarted_store).record_replacement_buy_fill(
+        plan.decision.decision_id, ports=restarted_ports
+    )
+    assert recovered.kind is ReplacementStepKind.COMPLETE
+    assert restarted_store.load_holding_episode_for_action(
+        partial.action.logical_action_id
+    ).confirmed_stop_broker_order_id != original_stop
 
 
 def test_buy_price_change_resolves_before_fake_broker_submission(tmp_path):

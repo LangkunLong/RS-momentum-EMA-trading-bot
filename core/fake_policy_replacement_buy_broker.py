@@ -187,6 +187,38 @@ class FakeProtectedReplacementBuyBroker:
                 raise ValueError("fake replacement buy has no durable fill receipt")
             return Decimal(receipt[10]), Decimal(receipt[11])
 
+    def has_accepted_contract(
+        self,
+        *,
+        client_order_id: str,
+        broker_order_id: str,
+        source_account_snapshot_id: str,
+        symbol: str,
+        quantity: Decimal,
+        limit_price: Decimal,
+        stop_price: Decimal,
+        candidate_price: Decimal,
+        holding_episode_id: str,
+    ) -> bool:
+        """Prove a recovered order has the exact durable fake-broker acceptance receipt."""
+        with self._lock:
+            receipt = self._receipt(client_order_id)
+            if receipt is None:
+                return False
+            self._validate_receipts_against_account()
+            return receipt[:10] == (
+                client_order_id,
+                broker_order_id,
+                self._account.paper_account_environment_id,
+                source_account_snapshot_id,
+                symbol,
+                str(quantity),
+                str(limit_price),
+                str(stop_price),
+                str(candidate_price),
+                holding_episode_id,
+            )
+
     def submit_protected_buy(
         self,
         *,

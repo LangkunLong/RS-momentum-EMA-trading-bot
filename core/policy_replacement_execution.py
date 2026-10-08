@@ -28,6 +28,7 @@ from core.policy_protection_bridge import PolicyProtectionBridge
 from core.policy_replacement import (
     ReplacementStep,
     ReplacementStepKind,
+    _confirmed_replacement_buy_stop,
     advance_replacement,
     load_replacement_intention,
 )
@@ -196,6 +197,20 @@ def reconcile_replacement_buy(decision_id: str, *, ports: ReplacementBuyPorts) -
     )
     if len(matches) != 1 or not matches[0].broker_order_id:
         return advance_replacement(ports.store, decision_id)
+    buy_record = ports.store.load_decision_record(execution.buy_decision.decision_id)
+    payload = buy_record.effective_action_payload
+    if not ports.broker.has_accepted_contract(
+        client_order_id=attempt.client_order_id,
+        broker_order_id=matches[0].broker_order_id,
+        source_account_snapshot_id=str(payload.get("account_snapshot_id")),
+        symbol=buy.broker_symbol,
+        quantity=buy.requested_quantity,
+        limit_price=buy.reservation_price,
+        stop_price=buy.reservation_stop_price,
+        candidate_price=Decimal(str(payload.get("candidate_price"))),
+        holding_episode_id=_holding_id(buy),
+    ):
+        return advance_replacement(ports.store, decision_id)
     projection = ports.store.load_action_projection(buy.logical_action_id)
     ports.store.bind_attempt_order_refs(
         buy.logical_action_id,
@@ -283,14 +298,14 @@ def _record_replacement_buy_fill_locked(
         cumulative_fees=Decimal("0"),
         observed_at=_observed_at(ports),
     )
+    action = ports.store.load_action_intent(action.logical_action_id)
     holding = ports.store.load_holding_episode_for_action(action.logical_action_id)
     if holding.holding_episode_id != _holding_id(action) or holding.remaining_quantity != quantity:
         raise ValueError("replacement buy holding did not converge to broker shares")
     if (
-        holding.confirmed_stop_client_order_id == stop.client_order_id
+        _confirmed_replacement_buy_stop(ports.store, action, holding)
+        and holding.confirmed_stop_client_order_id == stop.client_order_id
         and holding.confirmed_stop_broker_order_id == stop.broker_order_id
-        and holding.confirmed_protective_stop_price == action.reservation_stop_price
-        and holding.proposed_stop_action_id == holding.confirmed_stop_action_id
     ):
         return advance_replacement(ports.store, decision_id)
     if holding.proposed_stop_action_id != holding.confirmed_stop_action_id:
