@@ -579,6 +579,26 @@ def _valid_refreshed_context(
     return None
 
 
+def _flat_stop_retirement_reason(holding, sell: ActionIntent) -> str | None:
+    flags = dict(holding.policy_flags)
+    if (
+        flags.get("flat_stop_retired_by_action_id") != sell.logical_action_id
+        or not flags.get("flat_stop_absence_snapshot_id")
+        or any(
+            value is not None
+            for value in (
+                holding.proposed_stop_action_id,
+                holding.confirmed_stop_action_id,
+                holding.confirmed_stop_client_order_id,
+                holding.confirmed_stop_broker_order_id,
+                holding.confirmed_protective_stop_price,
+            )
+        )
+    ):
+        return "the sold holding's protective stop has not been durably retired"
+    return None
+
+
 def advance_replacement(
     store: PolicyExecutionStateStore,
     decision_id: str,
@@ -657,6 +677,28 @@ def advance_replacement(
                     resolved,
                     reason=reason,
                 )
+            sell = execution.sell_action
+            holding = store.load_holding_episode(sell.holding_episode_id or "")
+            if (
+                sell.status is not ActionStatus.FILLED
+                or sell.confirmed_filled_quantity != sell.requested_quantity
+                or holding.remaining_quantity != 0
+                or holding.pending_action_ids
+            ):
+                return ReplacementStep(
+                    ReplacementStepKind.WAITING_FOR_RECONCILIATION,
+                    decision_id,
+                    buy,
+                    reason="authorized buy still requires a fully settled source sale",
+                )
+            retirement_reason = _flat_stop_retirement_reason(holding, sell)
+            if retirement_reason is not None:
+                return ReplacementStep(
+                    ReplacementStepKind.WAITING_FOR_RECONCILIATION,
+                    decision_id,
+                    buy,
+                    reason=retirement_reason,
+                )
             return ReplacementStep(ReplacementStepKind.BUY_DUE, decision_id, buy)
         if buy.status is ActionStatus.FILLED:
             return ReplacementStep(ReplacementStepKind.COMPLETE, decision_id, buy)
@@ -705,25 +747,12 @@ def advance_replacement(
             decision_id,
             reason="sell fill and durable holding quantity have not reached the same flat state",
         )
-    flags = dict(holding.policy_flags)
-    if (
-        flags.get("flat_stop_retired_by_action_id") != sell.logical_action_id
-        or not flags.get("flat_stop_absence_snapshot_id")
-        or any(
-            value is not None
-            for value in (
-                holding.proposed_stop_action_id,
-                holding.confirmed_stop_action_id,
-                holding.confirmed_stop_client_order_id,
-                holding.confirmed_stop_broker_order_id,
-                holding.confirmed_protective_stop_price,
-            )
-        )
-    ):
+    retirement_reason = _flat_stop_retirement_reason(holding, sell)
+    if retirement_reason is not None:
         return ReplacementStep(
             ReplacementStepKind.WAITING_FOR_RECONCILIATION,
             decision_id,
-            reason="the sold holding's protective stop has not been durably retired",
+            reason=retirement_reason,
         )
     if account is None or portfolio_snapshot is None or candidate_price is None:
         return ReplacementStep(

@@ -14,6 +14,7 @@ from core.policy_execution_state import (
 )
 from core.policy_execution_store import PolicyExecutionStateStore
 from core.strategy_policy.account_reconciliation import AccountValuationClock, BrokerOrderFact
+import core.policy_replacement as replacement_module
 from core.policy_replacement import (
     ReplacementPlan,
     ReplacementStepKind,
@@ -346,6 +347,59 @@ def test_restart_between_full_sale_and_buy_releases_one_cash_bounded_action(tmp_
     assert replay_after_change.kind is ReplacementStepKind.BLOCKED
     assert replay_after_change.action is not None
     assert replay_after_change.action.status.value == "resolved"
+
+
+def test_persisted_buy_replay_waits_for_old_stop_retirement(tmp_path, monkeypatch):
+    store, plan, deployment, account, portfolio, original_holding = _replacement_fixture(tmp_path)
+    start_replacement(store, plan)
+    _submit_fake_sell(store, plan, plan.decision.clock.account_valuation_at)
+    _record_fake_sell_fill(
+        store,
+        plan,
+        str(plan.sell_action.requested_quantity),
+        observed_at=plan.decision.clock.account_valuation_at,
+    )
+    refreshed_account, refreshed_portfolio = _refreshed_after_full_sale(
+        store, account, portfolio, plan
+    )
+    # Simulate a buy intention persisted by the earlier state machine.
+    with monkeypatch.context() as patch:
+        patch.setattr(replacement_module, "_flat_stop_retirement_reason", lambda *_: None)
+        prior = advance_replacement(
+            store,
+            plan.decision.decision_id,
+            account=refreshed_account,
+            portfolio_snapshot=refreshed_portfolio,
+            candidate_price=Decimal("100"),
+        )
+    assert prior.kind is ReplacementStepKind.BUY_DUE
+    assert prior.action is not None
+
+    restarted = PolicyExecutionStateStore(store.db_path, store_identity=deployment.store_identity)
+    held = advance_replacement(
+        restarted,
+        plan.decision.decision_id,
+        account=refreshed_account,
+        portfolio_snapshot=refreshed_portfolio,
+        candidate_price=Decimal("100"),
+    )
+    assert held.kind is ReplacementStepKind.WAITING_FOR_RECONCILIATION
+    assert held.action is not None and held.action.logical_action_id == prior.action.logical_action_id
+    assert "stop" in (held.reason or "")
+    assert load_replacement_intention(restarted, plan.decision.decision_id).buy_action is not None
+
+    _retire_fake_flat_stop(
+        restarted, plan, original_holding, refreshed_account.account_snapshot_id
+    )
+    released = advance_replacement(
+        restarted,
+        plan.decision.decision_id,
+        account=refreshed_account,
+        portfolio_snapshot=refreshed_portfolio,
+        candidate_price=Decimal("100"),
+    )
+    assert released.kind is ReplacementStepKind.BUY_DUE
+    assert released.action is not None and released.action.logical_action_id == prior.action.logical_action_id
 
 
 def test_candidate_price_change_resolves_unsubmitted_buy_and_cannot_reopen(tmp_path):
